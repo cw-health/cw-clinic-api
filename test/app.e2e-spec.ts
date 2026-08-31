@@ -33,8 +33,8 @@ describe('App (e2e)', () => {
     await app.close();
   });
 
-  it('GET /api/v1/health returns 200 with an up status', async () => {
-    const response = await request(app.getHttpServer() as Server).get('/api/v1/health');
+  it('GET /api/v1/health/live returns 200 with an up status', async () => {
+    const response = await request(app.getHttpServer() as Server).get('/api/v1/health/live');
     expect(response.status).toBe(200);
     expect((response.body as { status: string }).status).toBe('ok');
   });
