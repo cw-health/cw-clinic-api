@@ -18,7 +18,7 @@ export class HealthController {
     private readonly disk: DiskHealthIndicator,
   ) {}
 
-  @Get()
+  @Get('/live')
   @HealthCheck()
   check() {
     return this.health.check([

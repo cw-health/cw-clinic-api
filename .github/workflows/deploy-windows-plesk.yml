@@ -1,9 +1,11 @@
-name: Deploy (Windows Plesk — dev)
+name: Deploy (Windows Plesk)
 
-# Builds on GitHub (this repo has no SSH access to the current Windows
-# Plesk host — RDP + Plesk UI only), then pushes just the deployable files
-# (no node_modules, no source) to the `plesk-deploy` branch using the
-# workflow's own built-in token — no external secrets needed.
+# Runs after a merge to main — CI (ci.yml) already gates PRs before they
+# land there. Builds on GitHub (this repo has no SSH access to the current
+# Windows Plesk host — RDP + Plesk UI only), then pushes just the
+# deployable files (no node_modules, no source) to the `plesk-deploy`
+# branch using the workflow's own built-in token — no external secrets
+# needed.
 #
 # On the Plesk side: `git clone`/`git pull` that branch (over RDP, since
 # there's no SSH), then run `npm install` there — node_modules gets built
@@ -15,7 +17,7 @@ name: Deploy (Windows Plesk — dev)
 
 on:
   push:
-    branches: [deploy-dev]
+    branches: [main]
   workflow_dispatch: {}
 
 permissions:
