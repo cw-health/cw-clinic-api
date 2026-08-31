@@ -1,6 +1,8 @@
 export interface AppConfig {
   nodeEnv: string;
-  port: number;
+  // Kept as a raw string — may be a TCP port number or (under iisnode on
+  // Windows Plesk) a named-pipe path. See src/main.ts for how it's used.
+  port: string;
   databaseUrl: string;
   corsOrigins: string[];
   throttle: {
@@ -13,7 +15,7 @@ export interface AppConfig {
 
 export default (): AppConfig => ({
   nodeEnv: process.env.NODE_ENV ?? 'development',
-  port: parseInt(process.env.PORT ?? '3000', 10),
+  port: process.env.PORT ?? '3000',
   databaseUrl: process.env.DATABASE_URL ?? '',
   corsOrigins: (process.env.CORS_ORIGINS ?? '')
     .split(',')

@@ -47,7 +47,13 @@ async function bootstrap(): Promise<void> {
     SwaggerModule.setup('api/docs', app, document);
   }
 
-  const port = configService.get('port', { infer: true });
+  // PORT may be a plain TCP port number (local dev, Docker, CI, future
+  // Linux) or a named-pipe path assigned by iisnode on Windows Plesk (e.g.
+  // "\\.\pipe\..."). Node's net.Server#listen() treats ANY string argument
+  // as a pipe/socket path, so a numeric string has to be converted to an
+  // actual Number to bind as a real TCP port.
+  const rawPort = configService.get('port', { infer: true });
+  const port = /^\d+$/.test(rawPort) ? Number(rawPort) : rawPort;
   await app.listen(port);
 }
 

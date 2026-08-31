@@ -12,7 +12,7 @@ describe('validateEnvironment', () => {
 
   it('accepts a valid configuration and coerces types', () => {
     const result = validateEnvironment(validConfig);
-    expect(result.PORT).toBe(3000);
+    expect(result.PORT).toBe('3000');
     expect(result.NODE_ENV).toBe('development');
   });
 
@@ -27,8 +27,13 @@ describe('validateEnvironment', () => {
     );
   });
 
-  it('rejects a PORT outside the valid range', () => {
-    expect(() => validateEnvironment({ ...validConfig, PORT: '70000' })).toThrow(
+  it('accepts a non-numeric PORT (iisnode assigns a named-pipe path on Windows Plesk)', () => {
+    const result = validateEnvironment({ ...validConfig, PORT: '\\\\.\\pipe\\some-guid' });
+    expect(result.PORT).toBe('\\\\.\\pipe\\some-guid');
+  });
+
+  it('rejects an empty PORT', () => {
+    expect(() => validateEnvironment({ ...validConfig, PORT: '' })).toThrow(
       /Environment validation failed/,
     );
   });

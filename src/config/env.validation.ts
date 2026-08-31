@@ -1,14 +1,5 @@
 import { Type, plainToInstance } from 'class-transformer';
-import {
-  IsIn,
-  IsInt,
-  IsNotEmpty,
-  IsOptional,
-  IsString,
-  Max,
-  Min,
-  validateSync,
-} from 'class-validator';
+import { IsIn, IsInt, IsNotEmpty, IsOptional, IsString, Min, validateSync } from 'class-validator';
 
 export enum NodeEnv {
   Development = 'development',
@@ -20,11 +11,13 @@ export class EnvironmentVariables {
   @IsIn([NodeEnv.Development, NodeEnv.Test, NodeEnv.Production])
   NODE_ENV: NodeEnv = NodeEnv.Development;
 
-  @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  @Max(65535)
-  PORT = 3000;
+  // Kept as a plain string, not validated as a bounded integer: iisnode
+  // (Windows Plesk) assigns this as a named-pipe path (e.g. "\\.\pipe\...")
+  // rather than a TCP port number, and app.listen() needs the raw value
+  // either way — see src/main.ts for the numeric-vs-pipe-path handling.
+  @IsString()
+  @IsNotEmpty()
+  PORT = '3000';
 
   @IsString()
   @IsNotEmpty()
