@@ -1,0 +1,31 @@
+# Local development/testing convenience only — not used for Plesk deployment
+# (see docs/DEPLOYMENT.md). Brings up SQL Server + the API for local work.
+services:
+  db:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "YourStrong!Passw0rd"
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+
+  api:
+    build: .
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      DATABASE_URL: "sqlserver://db:1433;database=cw_clinic;user=sa;password=YourStrong!Passw0rd;trustServerCertificate=true"
+      CORS_ORIGINS: "http://localhost:5173"
+      THROTTLE_TTL_MS: 60000
+      THROTTLE_LIMIT: 100
+      LOG_LEVEL: info
+      API_DOCS_ENABLED: "true"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - db
+
+volumes:
+  mssql-data:

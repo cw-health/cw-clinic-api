@@ -1,0 +1,156 @@
+// CW-CLINIC — Prisma schema foundation (Phase 1)
+//
+// Scope: Clinic, User, Role, Permission and the minimal join tables needed
+// to relate them, per docs/DATABASE.md and docs/RBAC.md. Business modules
+// (auth, doctors, patients, appointments, ...) are out of scope — see
+// docs/ROADMAP.md.
+//
+// Multi-tenancy: every tenant-scoped table carries a non-nullable clinicId
+// and leads its composite indexes with it (docs/DATABASE.md §1, §6).
+// clinicId is never accepted from client input — see docs/SECURITY.md §4.
+//
+// Status columns are plain String, not Prisma enum: the sqlserver connector
+// does not support native enums. Allowed values are documented per field and
+// validated at the application layer (DTOs), consistent with the "no
+// business modules yet" scope of this phase.
+
+// binaryTargets ships query engines for every host this app is deployed to,
+// generated once wherever CI runs (they're downloaded prebuilt, not
+// compiled locally, so this works regardless of the CI runner's own OS).
+// "native" covers local dev machines. "windows" covers the current Plesk
+// Windows target. "debian-openssl-3.0.x" covers the planned future Linux
+// Plesk host (Debian/Ubuntu-based) — confirm/adjust once that host's exact
+// distro is known, and drop "windows" once the Windows target is retired.
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "windows", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "sqlserver"
+  url      = env("DATABASE_URL")
+}
+
+/// Tenant registry. Global/platform table — no clinicId (docs/DATABASE.md §1).
+model Clinic {
+  id        String   @id @default(uuid())
+  name      String
+  slug      String   @unique
+  /// One of: ACTIVE, SUSPENDED, INACTIVE
+  status    String   @default("ACTIVE") @db.NVarChar(20)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships ClinicMembership[]
+  roles       Role[]
+
+  @@index([status])
+  @@map("clinics")
+}
+
+/// Platform identity. A User authenticates once and may hold a
+/// ClinicMembership per clinic they belong to (docs/RBAC.md §1, §5).
+/// isSuperAdmin marks the platform-level, non-clinic-scoped role
+/// (docs/RBAC.md §1) — not a Role row, since it is never clinic-configurable.
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  firstName    String
+  lastName     String
+  /// One of: ACTIVE, INACTIVE, SUSPENDED, PENDING
+  status       String   @default("PENDING") @db.NVarChar(20)
+  isSuperAdmin Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships ClinicMembership[]
+
+  @@index([status])
+  @@map("users")
+}
+
+/// Named, clinic-configurable bundle of Permissions (docs/RBAC.md §1).
+/// clinicId is nullable: a null clinicId is a system role template seeded
+/// as production reference data (docs/DATABASE.md §5); a clinic gets its
+/// own Role rows (clinicId set) cloned/customized from those templates once
+/// the roles module is built. NOTE: SQL Server does not treat multiple NULLs
+/// as equal in a unique index, so uniqueness of (clinicId, name) for
+/// clinic-scoped rows is enforced at the service layer, not the DB, until a
+/// filtered unique index is added — see "Known issues" in the Phase 1 report.
+/// clinic->Role uses NoAction (not Cascade): SQL Server rejects multiple
+/// cascade paths converging on ClinicMembership (direct Clinic->Membership
+/// and indirect Clinic->Role->Membership), so deleting a Clinic that still
+/// has custom Role rows is blocked until they're removed/reassigned first.
+model Role {
+  id          String   @id @default(uuid())
+  clinicId    String?
+  name        String
+  description String?
+  isSystem    Boolean  @default(false)
+  /// One of: ACTIVE, INACTIVE
+  status      String   @default("ACTIVE") @db.NVarChar(20)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  clinic          Clinic?            @relation(fields: [clinicId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  memberships     ClinicMembership[]
+  rolePermissions RolePermission[]
+
+  @@index([clinicId, status])
+  @@index([clinicId, name])
+  @@map("roles")
+}
+
+/// Fine-grained permission string, e.g. "appointments:create" (docs/RBAC.md §1).
+/// Fully global reference data — no clinicId.
+model Permission {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  description String
+  category    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  rolePermissions RolePermission[]
+
+  @@index([category])
+  @@map("permissions")
+}
+
+/// Role <-> Permission grant (docs/RBAC.md §1: "Role grants Permission[]").
+model RolePermission {
+  id           String   @id @default(uuid())
+  roleId       String
+  permissionId String
+  createdAt    DateTime @default(now())
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+/// User <-> Clinic <-> Role join (docs/RBAC.md §1: "User belongs to
+/// ClinicMembership has Role"). Tenant-scoped: clinicId is non-nullable.
+model ClinicMembership {
+  id        String   @id @default(uuid())
+  userId    String
+  clinicId  String
+  roleId    String
+  /// One of: ACTIVE, INACTIVE
+  status    String   @default("ACTIVE") @db.NVarChar(20)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  clinic Clinic @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  role   Role   @relation(fields: [roleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@unique([userId, clinicId])
+  @@index([clinicId, status])
+  @@index([roleId])
+  @@map("clinic_memberships")
+}

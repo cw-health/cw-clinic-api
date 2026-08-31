@@ -1,0 +1,63 @@
+name: CI
+
+# Implements docs/CI-CD.md §1 "CI" for cw-clinic-api. Runs the same way
+# regardless of deploy target (Windows now, Linux later) — nothing here is
+# OS-specific to the deploy host.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          # Ephemeral, single-job container torn down at job end — not a
+          # real secret, so it's fine to hardcode (docs/SECURITY.md §12
+          # governs actual production/deploy secrets, not this).
+          MSSQL_SA_PASSWORD: "CiOnly!Passw0rd123"
+        ports:
+          - 1433:1433
+
+    env:
+      NODE_ENV: test
+      DATABASE_URL: "sqlserver://localhost:1433;database=cw_clinic_ci;user=sa;password=CiOnly!Passw0rd123;trustServerCertificate=true"
+      CORS_ORIGINS: "http://localhost:5173"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      - name: Wait for SQL Server
+        run: |
+          for i in $(seq 1 30); do
+            nc -z localhost 1433 && exit 0
+            echo "Waiting for SQL Server... ($i/30)"
+            sleep 2
+          done
+          echo "SQL Server did not become reachable in time" >&2
+          exit 1
+
+      - run: npm run prisma:migrate:deploy
+
+      - run: npm run test:e2e
+
+      - run: npm run build

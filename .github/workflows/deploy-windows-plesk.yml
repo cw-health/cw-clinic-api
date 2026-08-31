@@ -1,0 +1,75 @@
+name: Deploy (Windows Plesk — dev)
+
+# Builds on GitHub (this repo has no SSH access to the current Windows
+# Plesk host — RDP + Plesk UI only), then ships the built artifact over
+# FTPS, since that's the transport Windows Plesk exposes without SSH.
+#
+# See docs/DEPLOYMENT-PLESK-WINDOWS.md for the one-time Plesk-side setup
+# this depends on, and its "Migrating to Linux later" section for exactly
+# what changes in this file when the target host changes — nothing else in
+# this repo needs to.
+
+on:
+  push:
+    branches: [deploy-dev]
+  workflow_dispatch: {}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # Full install (incl. devDependencies) — needed for `nest build`.
+      # `postinstall` also runs `prisma generate`, which — because
+      # prisma/schema.prisma sets binaryTargets to include "windows" — fetches
+      # a Windows-native query engine here even though this runner is Linux.
+      - run: npm ci
+
+      - run: npm run build
+
+      # Drop devDependencies from the artifact we actually ship. `prisma`
+      # and `@prisma/client` stay — they're runtime dependencies now, since
+      # `prisma migrate deploy` runs on the deployed box itself (see below).
+      - run: npm prune --omit=dev
+
+      - name: Deploy over FTPS
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.PLESK_FTP_HOST }}
+          username: ${{ secrets.PLESK_FTP_USER }}
+          password: ${{ secrets.PLESK_FTP_PASSWORD }}
+          protocol: ftps
+          local-dir: ./
+          server-dir: ${{ vars.PLESK_APP_DIR || '/httpdocs/' }}
+          exclude: |
+            **/.git*
+            **/.git*/**
+            **/.github/**
+            **/src/**
+            **/test/**
+            **/coverage/**
+            **/.env
+            **/.env.*
+
+  post-deploy:
+    needs: build-and-deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reminder — commands still need to run on the Plesk side
+        run: |
+          echo "FTPS only transfers files — it cannot run commands remotely."
+          echo "On the Plesk box (Node.js panel 'Run script', or a Scheduled"
+          echo "Task's 'Run Now'), still need to run by hand:"
+          echo "  1. npm run prisma:migrate:deploy"
+          echo "  2. (first deploy only, or when reference data changes) npm run seed"
+          echo "  3. Restart App in the Node.js panel"
+          echo ""
+          echo "See docs/DEPLOYMENT-PLESK-WINDOWS.md for the full sequence."
