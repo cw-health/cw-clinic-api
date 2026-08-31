@@ -1,23 +1,29 @@
 name: Deploy (Windows Plesk — dev)
 
 # Builds on GitHub (this repo has no SSH access to the current Windows
-# Plesk host — RDP + Plesk UI only), then ships the built artifact over
-# FTPS, since that's the transport Windows Plesk exposes without SSH.
+# Plesk host — RDP + Plesk UI only), then pushes just the deployable files
+# (no node_modules, no source) to the `plesk-deploy` branch using the
+# workflow's own built-in token — no external secrets needed.
 #
-# See docs/DEPLOYMENT-PLESK-WINDOWS.md for the one-time Plesk-side setup
-# this depends on, and its "Migrating to Linux later" section for exactly
-# what changes in this file when the target host changes — nothing else in
-# this repo needs to.
+# On the Plesk side: `git clone`/`git pull` that branch (over RDP, since
+# there's no SSH), then run `npm install` there — node_modules gets built
+# natively for that exact Windows machine, with zero binary-mismatch risk.
+#
+# See docs/DEPLOYMENT-PLESK-WINDOWS.md for the full one-time setup and the
+# "Migrating to Linux later" section for what changes when the host does —
+# nothing else in this repo needs to.
 
 on:
   push:
     branches: [deploy-dev]
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+
 jobs:
-  build-and-deploy:
+  build-and-publish:
     runs-on: ubuntu-latest
-    environment: dev
 
     steps:
       - uses: actions/checkout@v4
@@ -28,48 +34,45 @@ jobs:
           cache: npm
 
       # Full install (incl. devDependencies) — needed for `nest build`.
-      # `postinstall` also runs `prisma generate`, which — because
-      # prisma/schema.prisma sets binaryTargets to include "windows" — fetches
-      # a Windows-native query engine here even though this runner is Linux.
+      # `postinstall` also runs `prisma generate` here, but that generated
+      # client is NOT what ships — the Plesk box regenerates its own via
+      # `npm install` there, matching its own OS exactly.
       - run: npm ci
 
       - run: npm run build
 
-      # Drop devDependencies from the artifact we actually ship. `prisma`
-      # and `@prisma/client` stay — they're runtime dependencies now, since
-      # `prisma migrate deploy` runs on the deployed box itself (see below).
-      - run: npm prune --omit=dev
+      - name: Assemble deployable files
+        run: |
+          rm -rf /tmp/plesk-deploy
+          mkdir -p /tmp/plesk-deploy
+          cp -r dist prisma /tmp/plesk-deploy/
+          cp package.json package-lock.json prisma.config.ts /tmp/plesk-deploy/
+          # Dev/test seed fixtures aren't needed on the deployed box.
+          rm -f /tmp/plesk-deploy/prisma/seed.dev.ts /tmp/plesk-deploy/prisma/seed.test.ts
 
-      - name: Deploy over FTPS
-        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
-        with:
-          server: ${{ secrets.PLESK_FTP_HOST }}
-          username: ${{ secrets.PLESK_FTP_USER }}
-          password: ${{ secrets.PLESK_FTP_PASSWORD }}
-          protocol: ftps
-          local-dir: ./
-          server-dir: ${{ vars.PLESK_APP_DIR || '/httpdocs/' }}
-          exclude: |
-            **/.git*
-            **/.git*/**
-            **/.github/**
-            **/src/**
-            **/test/**
-            **/coverage/**
-            **/.env
-            **/.env.*
+      - name: Push to plesk-deploy branch
+        run: |
+          cd /tmp/plesk-deploy
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b plesk-deploy
+          git add -A
+          git commit -q -m "Deploy build from ${{ github.sha }}"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push -q --force origin plesk-deploy
 
-  post-deploy:
-    needs: build-and-deploy
+  post-publish:
+    needs: build-and-publish
     runs-on: ubuntu-latest
     steps:
-      - name: Reminder — commands still need to run on the Plesk side
+      - name: Reminder — pull and finish the deploy manually on Plesk
         run: |
-          echo "FTPS only transfers files — it cannot run commands remotely."
-          echo "On the Plesk box (Node.js panel 'Run script', or a Scheduled"
-          echo "Task's 'Run Now'), still need to run by hand:"
-          echo "  1. npm run prisma:migrate:deploy"
-          echo "  2. (first deploy only, or when reference data changes) npm run seed"
-          echo "  3. Restart App in the Node.js panel"
+          echo "plesk-deploy branch updated. Over RDP, on the Plesk box:"
+          echo "  1. git pull   (or first-time: git clone -b plesk-deploy <repo-url> <app-folder>)"
+          echo "  2. npm install   (regenerates the Prisma client natively for this machine)"
+          echo "  3. npm run prisma:migrate:deploy"
+          echo "  4. (first deploy only, or when reference data changes) npm run seed"
+          echo "  5. Restart App in the Plesk Node.js panel"
           echo ""
           echo "See docs/DEPLOYMENT-PLESK-WINDOWS.md for the full sequence."
