@@ -48,7 +48,7 @@ jobs:
           rm -rf /tmp/plesk-deploy
           mkdir -p /tmp/plesk-deploy
           cp -r dist prisma /tmp/plesk-deploy/
-          cp package.json package-lock.json prisma.config.ts /tmp/plesk-deploy/
+          cp package.json package-lock.json prisma.config.ts tsconfig.json /tmp/plesk-deploy/
           # Dev/test seed fixtures aren't needed on the deployed box.
           rm -f /tmp/plesk-deploy/prisma/seed.dev.ts /tmp/plesk-deploy/prisma/seed.test.ts
 
