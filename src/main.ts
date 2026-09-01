@@ -33,7 +33,10 @@ async function bootstrap(): Promise<void> {
     }),
   );
 
-  if (configService.get('apiDocsEnabled', { infer: true })) {
+  if (
+    configService.get('apiDocsEnabled', { infer: true }) &&
+    configService.get('nodeEnv', { infer: true }) !== 'production'
+  ) {
     const swaggerConfig = new DocumentBuilder()
       .setTitle('CW-CLINIC API')
       .setDescription('Backend API for CW-CLINIC — a multi-tenant clinic management platform.')

@@ -26,7 +26,9 @@ export class HealthController {
       () => this.memory.checkHeap('memoryHeap', 1024 * 1024 * 1024),
       () =>
         this.disk.checkStorage('diskStorage', {
-          path: '/',
+          // check-disk-space requires a drive-letter path on Windows
+          // (e.g. iisnode/Plesk) and a POSIX path elsewhere.
+          path: process.platform === 'win32' ? 'C:\\' : '/',
           thresholdPercent: 0.9,
         }),
     ]);
