@@ -44,6 +44,69 @@ export class EnvironmentVariables {
   @IsOptional()
   @IsIn(['true', 'false'])
   API_DOCS_ENABLED = 'true';
+
+  @IsString()
+  @IsNotEmpty()
+  JWT_ACCESS_SECRET!: string;
+
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  JWT_ACCESS_EXPIRES_IN = '15m';
+
+  @IsString()
+  @IsNotEmpty()
+  JWT_REFRESH_SECRET!: string;
+
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  JWT_REFRESH_EXPIRES_IN = '7d';
+
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  REFRESH_COOKIE_NAME = 'cw_refresh_token';
+
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  DOCUMENTS_STORAGE_DIR = './storage/documents';
+
+  @IsOptional()
+  @IsIn(['local', 's3'])
+  STORAGE_DRIVER = 'local';
+
+  @IsOptional()
+  @IsString()
+  S3_BUCKET = '';
+
+  @IsOptional()
+  @IsString()
+  S3_REGION = '';
+
+  @IsOptional()
+  @IsString()
+  S3_ENDPOINT = '';
+
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  REDIS_HOST = '127.0.0.1';
+
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  REDIS_PORT = 6379;
+
+  @IsOptional()
+  @IsString()
+  REDIS_PASSWORD = '';
+
+  @IsOptional()
+  @IsString()
+  FCM_SERVICE_ACCOUNT_JSON = '';
 }
 
 export function validateEnvironment(config: Record<string, unknown>): EnvironmentVariables {

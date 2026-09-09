@@ -24,11 +24,22 @@ jobs:
           MSSQL_SA_PASSWORD: "CiOnly!Passw0rd123"
         ports:
           - 1433:1433
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
 
     env:
       NODE_ENV: test
       DATABASE_URL: "sqlserver://localhost:1433;database=cw_clinic_ci;user=sa;password=CiOnly!Passw0rd123;trustServerCertificate=true"
       CORS_ORIGINS: "http://localhost:5173"
+      REDIS_HOST: "localhost"
+      REDIS_PORT: "6379"
 
     steps:
       - uses: actions/checkout@v4

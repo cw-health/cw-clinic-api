@@ -32,20 +32,607 @@ datasource db {
 }
 
 /// Tenant registry. Global/platform table — no clinicId (docs/DATABASE.md §1).
+/// Profile/contact/address/settings fields are a 1:1 extension of the tenant
+/// row itself (Phase 4) — a clinic has exactly one profile, not a
+/// one-to-many relation, so they live directly on Clinic rather than a
+/// separate table.
 model Clinic {
-  id        String   @id @default(uuid())
-  name      String
-  slug      String   @unique
-  /// One of: ACTIVE, SUSPENDED, INACTIVE
-  status    String   @default("ACTIVE") @db.NVarChar(20)
+  id     String @id @default(uuid())
+  name   String
+  slug   String @unique
+  /// One of: ACTIVE, SUSPENDED, INACTIVE, ARCHIVED. ARCHIVED is a status
+  /// transition (Super Admin clinic-registry lifecycle, SA-03), never a
+  /// hard delete — a clinic's own child data stays intact. Deliberately
+  /// separate from `onboardingStatus` below — a clinic's operational
+  /// lifecycle and its onboarding-completion progress are different
+  /// concerns and must not be overloaded onto one field (SA-03.1).
+  status String @default("ACTIVE") @db.NVarChar(20)
+
+  /// What kind of care facility this is (HOSPITAL | CLINIC |
+  /// DIAGNOSTIC_CENTER | POLYCLINIC | DENTAL_CLINIC | OTHER) — distinct
+  /// from `legalEntityType` below, which is the *business structure*
+  /// (LLP/partnership/etc), not the kind of facility. Plain string,
+  /// DTO-validated (dto/facility-type.ts), same convention as every other
+  /// status/category column in this schema. Nullable and deliberately
+  /// left out of the onboarding-completeness checklist below: it's a
+  /// genuinely new field added after clinics may already exist/have
+  /// completed onboarding, so it must never retroactively make an
+  /// already-COMPLETED clinic incomplete.
+  facilityType    String? @db.NVarChar(30)
+  /// Registered/legal business name, if different from the display `name`
+  /// above (e.g. "name" is a marketing DBA, this is the entity on the
+  /// registration certificate). Nullable — most clinics won't set this
+  /// distinctly from `name`.
+  legalName       String?
+  /// One of: INDIVIDUAL_PRACTITIONER, PARTNERSHIP, PRIVATE_COMPANY, LLP,
+  /// TRUST, SOCIETY, OTHER. Plain string (not a DB enum), validated in the
+  /// DTO allow-list, extensible without a migration — same convention as
+  /// every other status/category column in this schema. Deliberately not
+  /// jurisdiction-specific: "OTHER" covers any entity type outside this list.
+  legalEntityType String? @db.NVarChar(30)
+  description     String? @db.NVarChar(1000)
+
+  // Legal / registration profile (SA-03.1). All nullable: not every clinic
+  // has (or needs) this information at onboarding time — see
+  // `registrationApplicable` below rather than forcing a placeholder value.
+  registrationNumber     String?
+  registrationAuthority  String?
+  registrationDate       DateTime? @db.Date
+  registrationExpiryDate DateTime? @db.Date
+  /// False marks "no registration applies to this clinic" (e.g. an
+  /// individual practitioner in a jurisdiction with no formal clinic
+  /// registration) — distinct from "not yet provided". Onboarding
+  /// completeness only requires `registrationNumber` when this is true.
+  registrationApplicable Boolean   @default(true)
+
+  /// Generic tax-identifier pair, deliberately not named "gstNumber"/
+  /// "panNumber" — the product isn't scoped to one jurisdiction, so the
+  /// *type* (e.g. "GST", "VAT", "EIN") is data, not a hardcoded column.
+  /// Both nullable: most clinics won't have (or need) one recorded here.
+  taxIdentifierType  String?
+  taxIdentifierValue String?
+
+  // Contact information
+  contactEmail   String?
+  contactPhone   String?
+  /// Secondary contact number — distinct from `contactPhone` (the primary),
+  /// not a duplicate of it.
+  alternatePhone String?
+  website        String?
+
+  // Address
+  addressLine1 String?
+  addressLine2 String?
+  city         String?
+  state        String?
+  postalCode   String?
+  country      String?
+
+  // Clinic settings
+  timezone                          String @default("UTC")
+  /// ISO 4217 currency code this clinic bills/displays amounts in, e.g.
+  /// "INR", "USD" — same convention as `Plan.currency`. Defaulted (not
+  /// nullable) so every existing row gets a safe value with no backfill
+  /// migration required.
+  currency                          String @default("INR") @db.NVarChar(3)
+  defaultAppointmentDurationMinutes Int    @default(15)
+
+  /// Onboarding-completion tracking (SA-03.1), separate from `status`
+  /// above. One of: NOT_STARTED, IN_PROGRESS, COMPLETED. Recomputed
+  /// automatically after every clinic-registry write (ClinicsService) from
+  /// a fixed, deterministic checklist — never a workflow engine, and never
+  /// manually set through the API.
+  onboardingStatus      String    @default("NOT_STARTED") @db.NVarChar(20)
+  onboardingCompletedAt DateTime?
+
+  /// The tenant user who administers this clinic day-to-day (a `User` with
+  /// an ordinary `ClinicMembership`/`ClinicAdmin` `Role` row — never a
+  /// platform/`isSuperAdmin` account). Nullable: a clinic can exist before
+  /// one is assigned; explicit rather than inferred from "the first
+  /// ClinicAdmin membership created", since multiple ClinicAdmins can exist
+  /// per clinic and only one is the onboarding-designated primary contact.
+  primaryAdminUserId String?
+
+  /// Atomic per-clinic counters (Phase 6) incremented inside the
+  /// issue-invoice / record-payment transaction to generate human-facing
+  /// `Invoice.invoiceNumber` / `Payment.receiptNumber` without a global
+  /// sequence colliding across tenants.
+  invoiceSequence Int @default(0)
+  receiptSequence Int @default(0)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  memberships ClinicMembership[]
-  roles       Role[]
+  memberships          ClinicMembership[]
+  roles                Role[]
+  doctors              Doctor[]
+  patients             Patient[]
+  workingHours         ClinicWorkingHours[]
+  holidays             ClinicHoliday[]
+  documents            ClinicDocument[]
+  subscriptions        Subscription[]
+  featureFlagOverrides FeatureFlagOverride[]
+  branches             Branch[]
+  primaryAdminUser     User?                 @relation("ClinicPrimaryAdmin", fields: [primaryAdminUserId], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
   @@index([status])
+  @@index([onboardingStatus])
+  @@index([primaryAdminUserId])
   @@map("clinics")
+}
+
+/// Organizational unit under a Clinic (Phase 1B — Branch Management,
+/// docs/DECISIONS.md ADR-009). A clinic operates from one or more physical
+/// locations; Branch is the container for that location's own contact
+/// details/address/timezone and (in a later phase) its Departments/Doctors/
+/// Staff/Services.
+///
+/// Deliberately NOT wired onto Doctor/Patient/Appointment/etc yet: those
+/// models keep referencing `clinicId` directly, unchanged, so an existing
+/// single-branch clinic keeps working with zero migration/backfill (see
+/// ADR-009 "Migration strategy" — option A, resources stay clinic-level).
+/// A future phase adds an optional `branchId` to the resources that need
+/// branch-level scoping and backfills it gradually; this phase only
+/// introduces the Branch record itself.
+///
+/// `status` mirrors Clinic's own lifecycle convention (ACTIVE, INACTIVE,
+/// ARCHIVED) — archiving a branch is a status transition, not a hard
+/// delete, same reasoning as Clinic.status. `deletedAt` is included for
+/// consistency with every other clinic-scoped directory model
+/// (Doctor/Patient) so a future hard-delete path never needs a schema
+/// change, but no endpoint sets it in this phase — archive only ever moves
+/// `status` to ARCHIVED.
+model Branch {
+  id       String @id @default(uuid())
+  clinicId String
+
+  name String
+  /// Short human-facing code, unique within the clinic (e.g. "MAIN", "BLR-01") — distinct from `id`.
+  code String @db.NVarChar(20)
+
+  phone String?
+  email String?
+
+  address    String? @db.NVarChar(500)
+  city       String?
+  state      String?
+  postalCode String?
+  country    String?
+
+  /// IANA timezone name. Defaults to the clinic's own timezone at creation
+  /// time (service-layer default, not a DB-level copy) rather than a fixed
+  /// literal, since clinics span multiple regions.
+  timezone String @default("UTC")
+
+  /// One of: ACTIVE, INACTIVE, ARCHIVED.
+  status String @default("ACTIVE") @db.NVarChar(20)
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  clinic            Clinic             @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  departments       Department[]
+  /// Staff (Phase 1D) assigned to this branch — see ClinicMembership.branchId.
+  staff             ClinicMembership[]
+  /// Pharmacy module — inventory/purchases/stock/dispensing scoped to this
+  /// branch, see each model's own `branchId` doc comment.
+  medicineBatches   MedicineBatch[]
+  purchaseInvoices  PurchaseInvoice[]
+  stockMovements    StockMovement[]
+  pharmacyDispenses PharmacyDispense[]
+
+  @@unique([clinicId, code])
+  @@unique([clinicId, name])
+  @@index([clinicId, status])
+  @@index([clinicId, createdAt])
+  @@map("branches")
+}
+
+/// Organizational unit under a Branch (Phase 1C — Department Management).
+/// Deliberately distinct from `Specialization`: a Specialization
+/// ("Cardiology") is a global clinical-skill taxonomy a Doctor is tagged
+/// with, independent of any clinic; a Department ("Cardiology Department —
+/// Main Branch") is a clinic-specific organizational unit that groups
+/// doctors/staff for scheduling and administration within one Branch.
+/// Naming the same specialty twice (a Cardiology *department* staffed by
+/// doctors with the Cardiology *specialization*) is expected, not a
+/// duplicate concept — see the task brief's distinction.
+///
+/// Every Department belongs to exactly one Branch (Clinic -> Branch ->
+/// Department), so uniqueness/tenant scoping is enforced at the Branch
+/// level, not the Clinic level (docs/DATABASE.md §1's "unique within the
+/// correct tenant boundary" — here that boundary is the branch, since two
+/// branches of the same clinic may legitimately each run their own OPD).
+/// `clinicId` is a plain denormalized column with no Prisma relation
+/// object (same convention as `Appointment.clinicId`/
+/// `DoctorAvailability.clinicId`) so every tenant-scoped query can lead
+/// with it directly without a join, and so the only FK-cascade path from
+/// Clinic to Department is the existing Clinic -> Branch cascade — adding
+/// a second, direct Clinic -> Department FK would converge two cascade
+/// paths on the same table, which SQL Server rejects (same reasoning as
+/// the note on model Appointment).
+///
+/// `status` mirrors Branch/Clinic's own lifecycle convention (ACTIVE,
+/// INACTIVE, ARCHIVED) — archiving is a one-way status transition, never a
+/// hard delete. `deletedAt` is included for consistency with every other
+/// tenant-scoped directory model, but no endpoint sets it in this phase —
+/// same "reserved for a future hard-delete path" reasoning as Branch.
+model Department {
+  id       String @id @default(uuid())
+  clinicId String
+  branchId String
+
+  name String
+  /// Short human-facing code, unique within the branch (e.g. "OPD", "CARDIO") — distinct from `id`.
+  code String @db.NVarChar(20)
+
+  description String? @db.NVarChar(500)
+
+  /// One of: ACTIVE, INACTIVE, ARCHIVED.
+  status String @default("ACTIVE") @db.NVarChar(20)
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  branch  Branch             @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  doctors DoctorDepartment[]
+  /// Staff (Phase 1D) assigned to this department — see ClinicMembership.departmentId.
+  staff   ClinicMembership[]
+
+  @@unique([branchId, code])
+  @@unique([branchId, name])
+  @@index([clinicId, status])
+  @@index([clinicId, branchId])
+  @@index([clinicId, createdAt])
+  @@map("departments")
+}
+
+/// Doctor <-> Department grant (Phase 1C). Many-to-many, not one-to-one: a
+/// doctor commonly practices out of more than one department (e.g. both
+/// "OPD" and "Cardiology" at the same branch, or the same department across
+/// multiple branches), mirroring the DoctorSpecialization join pattern
+/// above rather than a single `departmentId` column on Doctor.
+model DoctorDepartment {
+  id           String @id @default(uuid())
+  doctorId     String
+  departmentId String
+
+  createdAt DateTime @default(now())
+
+  doctor     Doctor     @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  /// NoAction, not Cascade: Doctor already cascades from Clinic directly,
+  /// and Department cascades from Clinic via Branch — a second cascading
+  /// path here (Clinic -> Branch -> Department -> DoctorDepartment) would
+  /// converge with the first (Clinic -> Doctor -> DoctorDepartment), which
+  /// SQL Server rejects (same reasoning as the Role -> clinic note above).
+  /// In practice this never blocks anything: Department is archived, never
+  /// hard-deleted.
+  department Department @relation(fields: [departmentId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@unique([doctorId, departmentId])
+  @@index([departmentId])
+  @@map("doctor_departments")
+}
+
+/// A clinic-level business/legal document (registration certificate,
+/// license) — deliberately a separate model from `Document` (Phase 8),
+/// which is hard-wired to a required, PHI-scoped `patientId` and a
+/// different access model (clinic staff/patient, not Super Admin). Reuses
+/// the same physical storage layer (`DocumentStorageProvider`, injected via
+/// `DocumentsModule`) rather than a second storage mechanism — only the
+/// Prisma model and access control differ.
+model ClinicDocument {
+  id               String @id @default(uuid())
+  clinicId         String
+  uploadedByUserId String
+
+  /// One of: REGISTRATION_CERTIFICATE, LICENSE, OTHER
+  category String @db.NVarChar(30)
+
+  fileName  String @db.NVarChar(255)
+  mimeType  String @db.NVarChar(100)
+  sizeBytes Int
+
+  /// Server-internal storage path/key — never returned to a client. Reuses
+  /// `document-storage.util.ts`'s key-building convention, namespaced under
+  /// `clinic-documents/` so these never share a directory with patient
+  /// documents (docs/DATABASE.md §1-adjacent hygiene, not a security
+  /// boundary — the storage key is never client-derived either way).
+  storageKey String @db.NVarChar(500)
+
+  notes String? @db.NVarChar(1000)
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  clinic Clinic @relation(fields: [clinicId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([clinicId, createdAt])
+  @@map("clinic_documents")
+}
+
+/// One row per day of week (0=Sunday..6=Saturday) per clinic — the clinic's
+/// recurring weekly working hours (Phase 4). Tenant-scoped: clinicId leads
+/// the unique constraint per docs/DATABASE.md §1.
+model ClinicWorkingHours {
+  id        String   @id @default(uuid())
+  clinicId  String
+  dayOfWeek Int
+  isOpen    Boolean  @default(true)
+  /// "HH:mm" 24h, clinic-local time (docs/API.md §2: timezone conversion is
+  /// a display concern, but opening hours are inherently clinic-local, not
+  /// a UTC instant, so stored as a plain time-of-day string).
+  openTime  String?  @db.NVarChar(5)
+  closeTime String?  @db.NVarChar(5)
+  updatedAt DateTime @updatedAt
+
+  clinic Clinic @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  @@unique([clinicId, dayOfWeek])
+  @@map("clinic_working_hours")
+}
+
+/// A single non-recurring closure date (Phase 4). Tenant-scoped.
+model ClinicHoliday {
+  id        String   @id @default(uuid())
+  clinicId  String
+  date      DateTime @db.Date
+  name      String
+  createdAt DateTime @default(now())
+
+  clinic Clinic @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  @@unique([clinicId, date])
+  @@index([clinicId, date])
+  @@map("clinic_holidays")
+}
+
+/// Global reference/lookup table (docs/DATABASE.md §1: "genuinely global,
+/// no clinicId" — analogous to a shared medicine catalog). Seeded once;
+/// clinics attach doctors to entries via DoctorSpecialization rather than
+/// each clinic maintaining its own free-text taxonomy.
+model Specialization {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  createdAt DateTime @default(now())
+
+  doctors DoctorSpecialization[]
+
+  @@map("specializations")
+}
+
+/// Doctor <-> Specialization grant, mirroring the RolePermission join
+/// pattern (docs/RBAC.md §1).
+model DoctorSpecialization {
+  id               String @id @default(uuid())
+  doctorId         String
+  specializationId String
+
+  doctor         Doctor         @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  specialization Specialization @relation(fields: [specializationId], references: [id], onDelete: Cascade)
+
+  @@unique([doctorId, specializationId])
+  @@index([specializationId])
+  @@map("doctor_specializations")
+}
+
+/// Clinical staff directory entry (Phase 4). One-to-one with a User that
+/// holds a "Doctor" ClinicMembership for the same clinic — Doctor carries
+/// the clinical/professional profile fields that don't belong on the
+/// platform-wide User record. Soft-deleted (docs/DATABASE.md §8: history
+/// must survive removal for clinical/audit continuity).
+model Doctor {
+  id                         String    @id @default(uuid())
+  clinicId                   String
+  userId                     String    @unique
+  licenseNumber              String?
+  qualification              String?
+  bio                        String?   @db.NVarChar(2000)
+  phone                      String?
+  /// Decimal(10,2): currency amount, never a float (rounding).
+  consultationFee            Decimal?  @db.Decimal(10, 2)
+  yearsOfExperience          Int?
+  /// Nullable per-doctor override (Phase 5); falls back to
+  /// Clinic.defaultAppointmentDurationMinutes when unset.
+  appointmentDurationMinutes Int?
+  /// One of: ACTIVE, INACTIVE
+  status                     String    @default("ACTIVE") @db.NVarChar(20)
+  deletedAt                  DateTime?
+  createdAt                  DateTime  @default(now())
+  updatedAt                  DateTime  @updatedAt
+
+  /// NoAction, not Cascade (docs/DATABASE.md §7 safety migration, 2026-09-08):
+  /// Doctor is a soft-deleted clinical staff directory record (§8) with
+  /// FKs from Appointment/Consultation/Prescription/Invoice pointing at it
+  /// — a bare `prisma.clinic.delete()` cascading here would silently wipe
+  /// the clinical directory (and, wherever those child FKs are NoAction
+  /// too, simply fail with a constraint violation instead of the intended
+  /// archive-only lifecycle). Clinic has no hard-delete endpoint today
+  /// (status moves to ARCHIVED instead); this only forecloses a future
+  /// accidental one. Matches the NoAction convention already used for
+  /// Subscription/ClinicDocument/FeatureFlagOverride's own Clinic relation.
+  clinic          Clinic                 @relation(fields: [clinicId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  user            User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  specializations DoctorSpecialization[]
+  departments     DoctorDepartment[]
+  availability    DoctorAvailability[]
+  breaks          DoctorBreak[]
+  unavailability  DoctorUnavailability[]
+  /// onDelete: NoAction — see the note on model Appointment: cascading here
+  /// would converge with the Patient->Appointment cascade path from Clinic.
+  appointments    Appointment[]
+  queueEntries    QueueEntry[]
+  consultations   Consultation[]
+  prescriptions   Prescription[]
+  invoices        Invoice[]
+
+  @@index([clinicId, status])
+  @@index([clinicId, createdAt])
+  @@map("doctors")
+}
+
+/// Recurring break inside a doctor's working day (Phase 5) — e.g. lunch, or
+/// an afternoon break; multiple per day allowed, so no unique constraint.
+/// `clinicId` is denormalized from the owning Doctor exactly like
+/// DoctorAvailability above (plain indexed column, no FK relation) so
+/// tenant-scoped queries can lead with it without an extra join.
+model DoctorBreak {
+  id        String   @id @default(uuid())
+  clinicId  String
+  doctorId  String
+  dayOfWeek Int
+  startTime String   @db.NVarChar(5)
+  endTime   String   @db.NVarChar(5)
+  updatedAt DateTime @updatedAt
+
+  doctor Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@index([clinicId, doctorId])
+  @@map("doctor_breaks")
+}
+
+/// One-off block on a doctor's schedule (leave, ad-hoc unavailability),
+/// Phase 5 — a specific date/time range rather than a recurring
+/// day-of-week slot. `clinicId` denormalized as above.
+model DoctorUnavailability {
+  id        String   @id @default(uuid())
+  clinicId  String
+  doctorId  String
+  startsAt  DateTime
+  endsAt    DateTime
+  reason    String?
+  createdAt DateTime @default(now())
+
+  doctor Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@index([clinicId, doctorId, startsAt])
+  @@map("doctor_unavailability")
+}
+
+/// One row per day of week per doctor — recurring weekly availability
+/// (Phase 4). `clinicId` is denormalized from the owning Doctor so every
+/// tenant-scoped query/index here can lead with it directly per
+/// docs/DATABASE.md §1, without an extra join just to filter by tenant.
+model DoctorAvailability {
+  id        String   @id @default(uuid())
+  clinicId  String
+  doctorId  String
+  dayOfWeek Int
+  isActive  Boolean  @default(true)
+  startTime String   @db.NVarChar(5)
+  endTime   String   @db.NVarChar(5)
+  updatedAt DateTime @updatedAt
+
+  doctor Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@unique([doctorId, dayOfWeek])
+  @@index([clinicId, doctorId])
+  @@map("doctor_availability")
+}
+
+/// Patient registry entry (Phase 4). `userId` is nullable: front-desk
+/// registration does not require a login account, but a patient later
+/// granted mobile portal access is linked via userId (docs/ROADMAP.md
+/// Phase 2 "Mobile (Patient): view/edit own profile"). Deliberately narrow
+/// field set — docs instruct not collecting unnecessary sensitive
+/// information (no government ID, no full medical record; "basic history"
+/// only). Soft-deleted per docs/DATABASE.md §8.
+///
+/// NOTE: userId is intentionally NOT `@unique` here (Prisma-level), unlike
+/// Doctor.userId. SQL Server's unique constraint/index (unlike Postgres)
+/// treats multiple NULLs as duplicates, so a plain `@unique` nullable
+/// column allows only one portal-account-less patient per clinic before
+/// every subsequent registration 500s on a unique-constraint violation —
+/// hit in practice, see the Phase 4 test report's "known issues". Until
+/// the 2026-09-08 safety migration (docs/DATABASE.md §7), One-User-per-
+/// Patient was instead only a structural invariant enforced by
+/// application discipline (userId is only ever set from a User row
+/// created fresh in the same create() transaction, never reused) with no
+/// database backstop. A filtered unique index —
+/// `CREATE UNIQUE INDEX ... ON patients(userId) WHERE userId IS NOT
+/// NULL` — now enforces this at the database level too, without
+/// reintroducing the multiple-NULLs problem (rows with a NULL userId are
+/// excluded from the index entirely, so they never collide). Prisma's
+/// schema language has no declarative representation for a filtered/
+/// partial index, so this index exists only in the migration SQL
+/// (`prisma/migrations/20260908170000_db_safety_migration`) — it is
+/// intentionally not (and cannot be) expressed as an `@@unique` here.
+model Patient {
+  id          String    @id @default(uuid())
+  clinicId    String
+  userId      String?
+  /// Medical record number — human-facing identifier, unique per clinic
+  /// (docs/DATABASE.md §1: "unique per clinic, not globally"), not globally.
+  mrn         String
+  firstName   String
+  lastName    String
+  /// One of: MALE, FEMALE, OTHER, UNSPECIFIED
+  gender      String?   @db.NVarChar(20)
+  dateOfBirth DateTime? @db.Date
+  phone       String?
+  email       String?
+
+  addressLine1 String?
+  addressLine2 String?
+  city         String?
+  state        String?
+  postalCode   String?
+  country      String?
+
+  emergencyContactName  String?
+  emergencyContactPhone String?
+
+  /// Free-text "basic history" only (known allergies, chronic conditions) —
+  /// not a structured clinical record. Full clinical history lives in the
+  /// future consultations/diagnoses modules (docs/ROADMAP.md Phase 4/5).
+  knownAllergies    String? @db.NVarChar(1000)
+  chronicConditions String? @db.NVarChar(1000)
+
+  /// One of: ACTIVE, INACTIVE, ARCHIVED. ARCHIVED is reversible (Patient
+  /// Master upgrade, 2026-09-08) — a ClinicAdmin can restore() an archived
+  /// record back to ACTIVE, unlike Branch/Department/Clinic's one-way
+  /// archive: a patient can legitimately return, or staff can mis-archive
+  /// by mistake, and PHI must stay recoverable without touching
+  /// `deletedAt` (which remains reserved/unused — see the note below).
+  status    String    @default("ACTIVE") @db.NVarChar(20)
+  /// Reserved, never written by any endpoint — archive (above) is the only
+  /// removal-like action on a Patient; no hard/soft-delete route exists.
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  /// NoAction, not Cascade (docs/DATABASE.md §7 safety migration, 2026-09-08):
+  /// same reasoning as Doctor.clinic above — Patient is a soft-deleted,
+  /// PHI-bearing directory record with Appointment/Consultation/
+  /// Prescription/Invoice FKs pointing at it, and must never be silently
+  /// bulk-erased by a Clinic-level operation. Matches the NoAction
+  /// convention already used for Subscription/ClinicDocument/
+  /// FeatureFlagOverride's own Clinic relation.
+  clinic            Clinic             @relation(fields: [clinicId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  user              User?              @relation(fields: [userId], references: [id], onDelete: SetNull)
+  /// onDelete: NoAction on Appointment.patient — see the note on model
+  /// Appointment.
+  appointments      Appointment[]
+  consultations     Consultation[]
+  prescriptions     Prescription[]
+  invoices          Invoice[]
+  documents         Document[]
+  pharmacyDispenses PharmacyDispense[]
+
+  @@unique([clinicId, mrn])
+  @@index([clinicId, status])
+  @@index([clinicId, lastName, firstName])
+  @@index([clinicId, phone])
+  @@index([clinicId, createdAt])
+  // No plain @@index([userId]) here: replaced by the filtered unique index
+  // described above (migration-SQL-only, see the model doc comment) —
+  // it already covers every `where: { userId }` lookup this codebase does
+  // (always a concrete, non-null id) as well as enforcing uniqueness, so a
+  // second, redundant non-unique index on the same column isn't kept.
+  @@map("patients")
 }
 
 /// Platform identity. A User authenticates once and may hold a
@@ -64,20 +651,103 @@ model User {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  memberships ClinicMembership[]
+  memberships           ClinicMembership[]
+  refreshTokens         RefreshToken[]
+  doctor                Doctor?
+  /// Clinics this user is the onboarding-designated primary administrator
+  /// for (Clinic.primaryAdminUserId) — plural only because Prisma requires
+  /// an array-typed back-relation for a non-unique FK; in practice a user
+  /// primary-admins at most one clinic.
+  primaryAdminOfClinics Clinic[]            @relation("ClinicPrimaryAdmin")
+  /// Patient[] rather than Patient? even though a User in practice links to
+  /// at most one Patient: Patient.userId is deliberately not `@unique` (see
+  /// the note on model Patient) to work around SQL Server treating multiple
+  /// NULLs as a unique-constraint violation, and Prisma requires the
+  /// non-unique side of a one-to-one relation's FK to be array-typed.
+  patients              Patient[]
+  /// Set only while the account is PENDING (Phase 1D staff invite flow) —
+  /// see StaffInvitation's own doc comment.
+  staffInvitation       StaffInvitation?
+  /// At most one live row at a time — see PasswordResetToken's own doc comment.
+  passwordResetToken    PasswordResetToken?
 
   @@index([status])
   @@map("users")
+}
+
+/// Server-side refresh-token record (docs/SECURITY.md §1: rotation + reuse
+/// detection). Only a hash of the token is stored — the raw token is never
+/// persisted, only delivered to the client once (httpOnly cookie / Expo
+/// SecureStore). `clinicId` records which tenant context the token was
+/// issued for (a doctor with multiple memberships gets a distinct session
+/// per active clinic selection, per docs/RBAC.md §5) but carries no
+/// authority itself — it is never read back into a request's tenant
+/// context, only used to reissue a like-for-like access token on refresh.
+/// Hard-deleted on expiry cleanup (docs/DATABASE.md §8: no audit value in
+/// keeping expired auth tokens).
+model RefreshToken {
+  id                  String    @id @default(uuid())
+  userId              String
+  tokenHash           String    @unique
+  clinicId            String?
+  expiresAt           DateTime
+  revokedAt           DateTime?
+  /// Set when this token was consumed by a rotation, pointing at its
+  /// successor's hash — presenting a token that already has one set again
+  /// is reuse of a rotated-out token and revokes the whole family.
+  replacedByTokenHash String?
+  createdByIp         String?
+  createdAt           DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+/// Forgot/reset-password flow (same shape as StaffInvitation's set-password
+/// token). At most one live token per user — `userId` is `@unique`, so a
+/// fresh forgot-password request upserts over (invalidates) any earlier
+/// unused one. `usedAt` enforces single-use: reset() claims the token with
+/// a conditional `updateMany(... usedAt: null)` before touching the
+/// password, so a concurrent double-submit of the same link can only ever
+/// win once. Hard-deleted alongside the user on cascade; otherwise kept
+/// (not purged on expiry) since AuditLog references the event, not this row.
+model PasswordResetToken {
+  id          String    @id @default(uuid())
+  userId      String    @unique
+  tokenHash   String    @unique
+  expiresAt   DateTime
+  usedAt      DateTime?
+  createdByIp String?
+  createdAt   DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("password_reset_tokens")
 }
 
 /// Named, clinic-configurable bundle of Permissions (docs/RBAC.md §1).
 /// clinicId is nullable: a null clinicId is a system role template seeded
 /// as production reference data (docs/DATABASE.md §5); a clinic gets its
 /// own Role rows (clinicId set) cloned/customized from those templates once
-/// the roles module is built. NOTE: SQL Server does not treat multiple NULLs
-/// as equal in a unique index, so uniqueness of (clinicId, name) for
-/// clinic-scoped rows is enforced at the service layer, not the DB, until a
-/// filtered unique index is added — see "Known issues" in the Phase 1 report.
+/// the roles module is built. Uniqueness of (clinicId, name) for
+/// clinic-scoped rows was, until the 2026-09-08 safety migration
+/// (docs/DATABASE.md §7), enforced only at the service layer, not the DB —
+/// see "Known issues" in the Phase 1 report. A filtered unique index —
+/// `CREATE UNIQUE INDEX ... ON roles(clinicId, name) WHERE clinicId IS NOT
+/// NULL` — now backstops it in the database for every clinic-scoped
+/// (non-null clinicId) row, deliberately excluding the null-clinicId system
+/// templates from that constraint (their own naming collisions, if any,
+/// stay a service-layer/seed-data concern, same as before — a template
+/// reused verbatim across environments is not the same failure mode as a
+/// clinic accidentally creating two same-named custom roles). As with
+/// Patient.userId above, Prisma's schema language has no declarative
+/// representation for a filtered/partial index, so this index exists only
+/// in the migration SQL
+/// (`prisma/migrations/20260908170000_db_safety_migration`), not as an
+/// `@@unique` here — the plain `@@index([clinicId, name])` below stays for
+/// query support; it doesn't itself enforce uniqueness.
 /// clinic->Role uses NoAction (not Cascade): SQL Server rejects multiple
 /// cascade paths converging on ClinicMembership (direct Clinic->Membership
 /// and indirect Clinic->Role->Membership), so deleting a Clinic that still
@@ -135,22 +805,1384 @@ model RolePermission {
 
 /// User <-> Clinic <-> Role join (docs/RBAC.md §1: "User belongs to
 /// ClinicMembership has Role"). Tenant-scoped: clinicId is non-nullable.
+///
+/// branchId/departmentId (Phase 1D — Staff Management) record which of the
+/// clinic's own Branch/Department a staff member is assigned to for
+/// organizational/scheduling purposes — both nullable since not every role
+/// needs one (e.g. a ClinicAdmin may be clinic-wide) and a clinic may not
+/// use branches/departments at all. Deliberately placed here rather than on
+/// User: assignment is a property of *this clinic's* working relationship
+/// with the user, not of their identity (docs/RBAC.md's own "identity vs.
+/// membership" split), and a doctor with memberships at two clinics
+/// (docs/RBAC.md §5) can have a different branch/department per clinic.
+/// onDelete: NoAction on branch/department (not SetNull) for the same
+/// reason as `role` below: SQL Server rejects multiple cascade paths
+/// converging on ClinicMembership (a direct Clinic->ClinicMembership path
+/// and an indirect Clinic->Branch->ClinicMembership / Clinic->Branch->
+/// Department->ClinicMembership path). In practice this never blocks a
+/// real deletion — Branch/Department are archived (a status change), never
+/// hard-deleted, per their own model doc comments.
 model ClinicMembership {
-  id        String   @id @default(uuid())
-  userId    String
-  clinicId  String
-  roleId    String
+  id           String   @id @default(uuid())
+  userId       String
+  clinicId     String
+  roleId       String
+  branchId     String?
+  departmentId String?
   /// One of: ACTIVE, INACTIVE
-  status    String   @default("ACTIVE") @db.NVarChar(20)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  status       String   @default("ACTIVE") @db.NVarChar(20)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  clinic Clinic @relation(fields: [clinicId], references: [id], onDelete: Cascade)
-  role   Role   @relation(fields: [roleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  clinic     Clinic      @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  role       Role        @relation(fields: [roleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  branch     Branch?     @relation(fields: [branchId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  department Department? @relation(fields: [departmentId], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
   @@unique([userId, clinicId])
   @@index([clinicId, status])
   @@index([roleId])
+  @@index([branchId])
+  @@index([departmentId])
   @@map("clinic_memberships")
+}
+
+/// One-time set-password invitation for a staff account created via
+/// `POST /staff` (Phase 1D). A newly invited User row is created with
+/// `status: "PENDING"` and an unusable random password hash — this row's
+/// `tokenHash` is the only way to activate it. Only a hash is stored (same
+/// pattern as RefreshToken.tokenHash); the raw token is returned once, at
+/// creation/resend time, for the ClinicAdmin to share out-of-band — see the
+/// doc comment on StaffService.invite for why (no email provider is wired
+/// yet). `userId` is `@unique`: at most one live invitation per user,
+/// creating a new one (resend) replaces it rather than accumulating rows.
+model StaffInvitation {
+  id         String    @id @default(uuid())
+  userId     String    @unique
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  acceptedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("staff_invitations")
+}
+
+/// Platform-level subscription plan catalog entry (SA-06,
+/// docs/SUPER_ADMIN_ARCHITECTURE.md §6.5) — global reference/catalog data,
+/// no clinicId (docs/DATABASE.md §1: "genuinely global, no clinicId"),
+/// same category as Clinic/Permission. A clinic's actual subscription to a
+/// Plan is a separate, tenant-scoped concern (SA-07, out of scope here) —
+/// this model only defines what a plan *is*, not who has it.
+///
+/// Limits are typed nullable columns, not a JSON blob: the brief explicitly
+/// calls for normalization over "an uncontrolled JSON blob", and this is a
+/// small, fixed, always-1:1-with-the-plan set of scalars — a separate table
+/// would be over-normalization for that shape. `null` means "unlimited" for
+/// that dimension. Feature grants, by contrast, are a variable-length set
+/// (zero or more of a known key catalog), which is what PlanFeature below
+/// normalizes instead of a second blob.
+model Plan {
+  id          String  @id @default(uuid())
+  name        String
+  description String? @db.NVarChar(1000)
+
+  /// One of: ACTIVE, INACTIVE. Managed only via the activate/deactivate
+  /// endpoints, never a bare PATCH — mirrors Clinic's lifecycle pattern.
+  status String @default("ACTIVE") @db.NVarChar(20)
+
+  /// Decimal(10,2): currency amount, never a float (rounding) — same
+  /// convention as Invoice/Payment amounts.
+  price    Decimal @db.Decimal(10, 2)
+  /// ISO 4217 currency code, e.g. "INR", "USD".
+  currency String  @default("INR") @db.NVarChar(3)
+
+  /// One of: MONTHLY, QUARTERLY, YEARLY.
+  billingInterval String @db.NVarChar(20)
+
+  /// Usage limits. Null = unlimited for that dimension. Deliberately just
+  /// the dimensions the product actually needs today (SA-06 brief) — not
+  /// speculative future billing metrics (storage/AI/API usage have no
+  /// consuming module yet, so they're not added here; see
+  /// docs/SUPER_ADMIN_ARCHITECTURE.md §21 MVP vs Future).
+  maxDoctors  Int?
+  maxStaff    Int?
+  maxPatients Int?
+  maxBranches Int?
+
+  /// Trial length in days offered on this plan. Null/0 = no trial.
+  trialDays Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  features      PlanFeature[]
+  subscriptions Subscription[]
+
+  @@unique([name])
+  @@index([status])
+  @@map("plans")
+}
+
+/// A clinic's subscription to a `Plan` (SA-07,
+/// docs/SUPER_ADMIN_ARCHITECTURE.md §6.6) — tenant-scoped (`clinicId`
+/// non-nullable), FK to `Plan`. History is preserved rather than
+/// overwritten: assigning a *different* plan supersedes the current row
+/// (`status` -> SUPERSEDED, `supersededAt` set) and creates a new row,
+/// mirroring `Prescription`'s SUPERSEDED-on-amendment convention rather
+/// than updating `planId` in place. Status transitions that don't change
+/// the plan (activate/suspend/cancel) update the current row in place,
+/// matching `Clinic`/`Plan`'s own status-lifecycle convention — this is a
+/// lifecycle change, not a plan change, so it doesn't need a new row.
+///
+/// "Current subscription" for a clinic = the most recently created row
+/// (no separate `isCurrent` flag needed: exactly one non-SUPERSEDED row
+/// ever exists per clinic at a time, enforced at the application layer in
+/// `SubscriptionsService`).
+model Subscription {
+  id       String @id @default(uuid())
+  clinicId String
+  planId   String
+
+  /// One of: TRIAL, ACTIVE, PAST_DUE, SUSPENDED, CANCELLED, EXPIRED,
+  /// SUPERSEDED. SUPERSEDED is system-set only when a plan change replaces
+  /// this row — never a status a Super Admin transitions to directly.
+  status String @default("ACTIVE") @db.NVarChar(20)
+
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+
+  /// Set when this subscription's plan grants a trial (`Plan.trialDays`
+  /// at assignment time) — null if no trial applies.
+  trialEndsAt DateTime?
+
+  cancelledAt        DateTime?
+  cancellationReason String?   @db.NVarChar(500)
+  /// Set when a plan change replaces this row with a new one (see model doc comment above).
+  supersededAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Restrict, not Cascade (docs/SUPER_ADMIN_ARCHITECTURE.md §7): a clinic
+  /// being archived must not silently delete subscription/billing history,
+  /// same reasoning as Doctor/Patient being soft-deleted rather than
+  /// cascaded away.
+  clinic Clinic @relation(fields: [clinicId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  /// Restrict: a plan in use is never silently deleted (matches the
+  /// existing financial-record onDelete discipline).
+  plan   Plan   @relation(fields: [planId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([clinicId, createdAt])
+  @@index([clinicId, status])
+  @@index([planId])
+  @@map("subscriptions")
+}
+
+/// A single feature key granted by a Plan (SA-06) — normalized instead of
+/// a JSON array column on Plan: presence of a row is the grant (no separate
+/// `enabled` boolean to drift out of sync with row existence). `key` is
+/// validated against a small fixed catalog at the application layer
+/// (PLAN_FEATURE_KEYS), the same "plain string, DTO-validated" convention
+/// as every other enum-shaped column in this schema. Distinct from the
+/// global feature-flag system (SA-07, not built here): this table only
+/// says what a *plan* includes, not runtime precedence/overrides.
+model PlanFeature {
+  id        String   @id @default(uuid())
+  planId    String
+  key       String   @db.NVarChar(50)
+  createdAt DateTime @default(now())
+
+  plan Plan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@unique([planId, key])
+  @@index([key])
+  @@map("plan_features")
+}
+
+/// Global feature-flag definition (SA-08,
+/// docs/SUPER_ADMIN_ARCHITECTURE.md §6.7) — not tenant-scoped: `enabled` is
+/// the platform-wide default every clinic evaluates against unless a
+/// `FeatureFlagOverride` row exists for it. Deliberately no plan-level
+/// layer here (Phase 2 per the architecture doc) and no targeting rules
+/// beyond the two supported here — just global default + optional
+/// per-clinic override, evaluated by the single `FeatureFlagsService`.
+model FeatureFlag {
+  id          String  @id @default(uuid())
+  /// Stable machine key call sites check against, e.g. "new-billing-ui".
+  key         String  @unique @db.NVarChar(100)
+  name        String  @db.NVarChar(150)
+  description String? @db.NVarChar(1000)
+
+  /// Global default state. For a GLOBAL-scope flag this is the only thing
+  /// evaluated; for a CLINIC-scope flag a clinic's own
+  /// FeatureFlagOverride (if any) takes precedence over this value.
+  enabled Boolean @default(false)
+
+  /// One of: GLOBAL, CLINIC. GLOBAL = evaluated the same for every clinic,
+  /// no override is meaningful. CLINIC = a clinic-specific
+  /// FeatureFlagOverride may flip this flag independently of the global
+  /// default. Plain string, DTO-validated — same enum-by-convention
+  /// pattern as every other status/category column in this schema.
+  scope String @default("GLOBAL") @db.NVarChar(20)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  overrides FeatureFlagOverride[]
+
+  @@index([scope])
+  @@map("feature_flags")
+}
+
+/// Per-clinic override of a `FeatureFlag` (SA-08) — only meaningful when
+/// the parent flag's `scope` is CLINIC; the evaluation service ignores any
+/// override left behind on a flag since demoted to GLOBAL scope rather
+/// than deleting it, so demoting and re-promoting a flag doesn't lose prior
+/// per-clinic decisions. `clinic` uses `NoAction`, not `Cascade` — same
+/// reasoning as `Subscription.clinic`: a clinic being archived must not
+/// silently delete platform records referencing it.
+model FeatureFlagOverride {
+  id       String  @id @default(uuid())
+  flagId   String
+  clinicId String
+  enabled  Boolean
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  flag   FeatureFlag @relation(fields: [flagId], references: [id], onDelete: Cascade)
+  clinic Clinic      @relation(fields: [clinicId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@unique([flagId, clinicId])
+  @@index([clinicId])
+  @@map("feature_flag_overrides")
+}
+
+/// Booked appointment slot (Phase 5). `clinicId` is a plain indexed column
+/// with no FK relation to Clinic — same denormalization pattern as
+/// DoctorAvailability above — because Appointment already has cascading FKs
+/// to both Doctor and Patient, and SQL Server rejects multiple cascade
+/// paths converging on the same table (Clinic->Doctor->Appointment and
+/// Clinic->Patient->Appointment would both be cascade paths from Clinic).
+/// The doctor/patient FKs themselves are onDelete: NoAction for the same
+/// reason (mirrors the Role->clinic NoAction note above) — in practice this
+/// never blocks anything since Doctor/Patient are soft-deleted, never
+/// hard-deleted, while appointment history exists.
+///
+/// Status is plain String (no DB enum on SQL Server), validated at the
+/// application layer via the single ALLOWED_TRANSITIONS map in
+/// appointments.service.ts. Per-transition timestamp columns
+/// (confirmedAt/checkedInAt/...) give sufficient history without a generic
+/// audit-log table, which doesn't exist yet (out of scope for this phase).
+model Appointment {
+  id        String @id @default(uuid())
+  clinicId  String
+  doctorId  String
+  patientId String
+
+  startsAt DateTime
+  endsAt   DateTime
+
+  /// One of: SCHEDULED, CONFIRMED, CHECKED_IN, WAITING, IN_CONSULTATION,
+  /// COMPLETED, CANCELLED, NO_SHOW
+  status String @default("SCHEDULED") @db.NVarChar(20)
+
+  /// One of: WALK_IN, SCHEDULED, FOLLOW_UP. Set once at creation, never
+  /// changed after (no endpoint mutates it) — see AppointmentsService's
+  /// create()/createOwn()/createWalkIn().
+  type String @default("SCHEDULED") @db.NVarChar(20)
+
+  reasonForVisit String? @db.NVarChar(500)
+  notes          String? @db.NVarChar(1000)
+
+  createdByUserId String
+
+  confirmedAt           DateTime?
+  checkedInAt           DateTime?
+  consultationStartedAt DateTime?
+  completedAt           DateTime?
+  noShowAt              DateTime?
+  cancelledAt           DateTime?
+  cancelledByUserId     String?
+  cancellationReason    String?   @db.NVarChar(500)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  doctor  Doctor  @relation(fields: [doctorId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  consultation Consultation?
+  queueEntry   QueueEntry?
+
+  @@index([clinicId, doctorId, startsAt])
+  @@index([clinicId, patientId, startsAt])
+  @@index([clinicId, status])
+  /// Status+date-range filtered list queries (AppointmentsService.findAll's
+  /// `{ clinicId, status?, doctorId?, startsAt: range? }` where-clause).
+  /// Previously justified by the live queue view (findQueue/callNext) too
+  /// — that responsibility moved to QueueEntry below (2026-09-09 queue
+  /// upgrade: see docs/DECISIONS.md), which no longer queries Appointment
+  /// by status at all, but findAll's own filtered/paginated list still
+  /// benefits from both composites, so they stay.
+  @@index([clinicId, status, startsAt])
+  @@index([clinicId, doctorId, status, startsAt])
+  @@map("appointments")
+}
+
+/// **Today's operational queue** (2026-09-09 upgrade — docs/DECISIONS.md).
+/// One row per checked-in appointment for *today*, holding the
+/// queue-specific concepts `Appointment` was never meant to carry: a
+/// per-scope sequential `tokenNumber`, and the operational states between
+/// "waiting" and "in consultation" (`CALLED`, `SKIPPED`) that have no
+/// equivalent on the appointment lifecycle. This is deliberately a
+/// *second*, narrower state machine layered on top of `Appointment`'s
+/// booking lifecycle, not a duplicate of it:
+/// - `Appointment.status` is still the single source of truth for the
+///   booking lifecycle (SCHEDULED → ... → COMPLETED/CANCELLED/NO_SHOW).
+///   `QueueService` only ever changes it by calling `AppointmentsService`'s
+///   existing transition methods (`waiting()`/`start()`/`complete()`/
+///   `noShow()`) — it never writes `Appointment.status` directly, and
+///   `AppointmentsService`'s `ALLOWED_TRANSITIONS` is the only place any
+///   Appointment status transition is validated.
+/// - `QueueEntry.status` tracks only the same-day operational sequencing a
+///   front desk/doctor actually interacts with (WAITING → CALLED →
+///   IN_CONSULTATION → COMPLETED, with CALLED/WAITING → SKIPPED/NO_SHOW),
+///   which has no Appointment-level meaning of its own (a "called" or
+///   "skipped" patient is still just WAITING as far as the booking
+///   lifecycle is concerned).
+///
+/// One entry per Appointment (`appointmentId` unique) — `generateToken` is
+/// idempotent, never creating a second entry for the same appointment.
+/// `tokenNumber` is scoped to `(clinicId, doctorId, queueDate)`: Doctor is
+/// the actual queueing resource ("who does a patient wait to see"), and
+/// `Appointment` carries no `branchId`/`departmentId` today (a documented
+/// future-phase gap — see the note on `model Department`), so a
+/// Branch/Department scope isn't available to key off yet. `queueDate` is
+/// the clinic-local calendar day (midnight-normalized UTC instant, same
+/// derivation as `AppointmentsService`'s day-range helper, extracted to
+/// `common/clinic-day.util.ts` so both modules share it) rather than a
+/// plain `DateTime.now()` range, so a token survives being queried right
+/// across midnight.
+///
+/// `position` is deliberately not a stored column: persisting it would
+/// mean rewriting every other WAITING row's position on every call/skip/
+/// recall (lock contention for no benefit) — `QueueService` computes it at
+/// read time from `tokenNumber` order among currently-WAITING rows.
+model QueueEntry {
+  id            String @id @default(uuid())
+  clinicId      String
+  doctorId      String
+  appointmentId String @unique
+
+  /// Clinic-local calendar day this token belongs to, UTC-midnight
+  /// normalized (see model doc comment) — not `startsAt`, since a walk-in's
+  /// `startsAt` is "now" but a scheduled patient's `startsAt` may be
+  /// earlier in the day than when they actually check in.
+  queueDate DateTime
+
+  /// Sequential within (clinicId, doctorId, queueDate) — see @@unique
+  /// below, which is both the display token and the concurrency backstop
+  /// (docs/DATABASE.md's queue section: two receptionists generating a
+  /// token at the same moment cannot receive the same number).
+  tokenNumber Int
+
+  /// One of: WAITING, CALLED, IN_CONSULTATION, COMPLETED, SKIPPED, NO_SHOW
+  /// — QueueService's own transition table (queue.service.ts), a narrower,
+  /// separate state machine from Appointment.status (see model doc
+  /// comment).
+  status String @default("WAITING") @db.NVarChar(20)
+
+  calledAt              DateTime?
+  /// Bumped on every call-next/recall — lets the UI show "called Nx" for a
+  /// patient who hasn't responded.
+  calledCount           Int       @default(0)
+  consultationStartedAt DateTime?
+  completedAt           DateTime?
+  skippedAt             DateTime?
+  noShowAt              DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // clinicId carries no Prisma @relation, matching Appointment's own
+  // clinicId column above — tenant scoping is enforced at the query layer
+  // (every QueueService call site folds `clinicId` into its `where`), not
+  // via an FK relation object; Clinic has no reverse `appointments`/
+  // `queueEntries` list either, for the same reason.
+  doctor      Doctor      @relation(fields: [doctorId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  /// The concurrency-safety backstop for token generation (docs/DATABASE.md
+  /// queue section): even if the Serializable transaction in
+  /// `QueueService`'s token allocator somehow raced, this index makes a
+  /// duplicate `(clinicId, doctorId, queueDate, tokenNumber)` a hard DB
+  /// constraint violation, not just an application-level bug — the same
+  /// "isolation + retry, backstopped by a unique index" pattern already
+  /// used for `assertNoOverlap`.
+  @@unique([clinicId, doctorId, queueDate, tokenNumber])
+  /// Doctor-scoped "today's queue" (`GET /queue/me`, call-next/recall/skip/
+  /// start/complete's candidate lookups) — `QueueService`'s actual
+  /// where-clauses always lead with these four columns.
+  @@index([clinicId, doctorId, queueDate, status])
+  /// Clinic-wide "today's queue" (`GET /queue`, front-desk board view).
+  @@index([clinicId, queueDate, status])
+  @@map("queue_entries")
+}
+
+/// Structured consultation record (Phase 4), one per Appointment
+/// (appointmentId unique — an appointment has at most one consultation).
+/// clinicId/doctorId/patientId are denormalized off the appointment, same
+/// rationale and onDelete: NoAction as documented above on Appointment
+/// (Clinic->Doctor/Patient->Consultation would otherwise be a second
+/// cascade path alongside Clinic->...->Appointment->Consultation).
+///
+/// Deliberately structured, not one notes field: chiefComplaint/symptoms/
+/// history/vitals/examination/diagnosis/investigations/treatment/advice/
+/// followUp are separate typed columns; `notes` is only the catch-all for
+/// whatever doesn't fit the structured fields above.
+///
+/// `templateKey` + `customFields` are an extensibility hook for future
+/// specialty-specific templates (e.g. pediatrics, cardiology) — no template
+/// engine exists yet, `customFields` is an app-validated JSON string, not a
+/// schema-enforced shape.
+model Consultation {
+  id            String @id @default(uuid())
+  clinicId      String
+  appointmentId String @unique
+  doctorId      String
+  patientId     String
+
+  /// One of: IN_PROGRESS, COMPLETED
+  status String @default("IN_PROGRESS") @db.NVarChar(20)
+
+  chiefComplaint String  @db.NVarChar(1000)
+  symptoms       String? @db.NVarChar(2000)
+  history        String? @db.NVarChar(2000)
+
+  // Vitals — discrete typed columns, not a blob, so they can be charted/
+  // queried later without parsing free text.
+  heightCm               Float?
+  weightKg               Float?
+  temperatureCelsius     Float?
+  pulseBpm               Int?
+  bloodPressureSystolic  Int?
+  bloodPressureDiastolic Int?
+  respiratoryRate        Int?
+  spo2Percent            Int?
+
+  examination    String? @db.NVarChar(2000)
+  diagnosis      String? @db.NVarChar(2000)
+  investigations String? @db.NVarChar(2000)
+  treatment      String? @db.NVarChar(2000)
+  advice         String? @db.NVarChar(1000)
+
+  followUpDate         DateTime? @db.Date
+  followUpInstructions String?   @db.NVarChar(500)
+
+  notes String? @db.NVarChar(2000)
+
+  templateKey  String? @db.NVarChar(50)
+  customFields String? @db.NVarChar(4000)
+
+  createdByUserId String
+  completedAt     DateTime?
+
+  /// Soft delete only (docs/DATABASE.md §8 names consultations explicitly
+  /// as a clinical record whose history must survive a "delete") — no
+  /// delete endpoint exists yet, this column is here so one can be added
+  /// later without a schema change.
+  deletedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  appointment         Appointment             @relation(fields: [appointmentId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  doctor              Doctor                  @relation(fields: [doctorId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  patient             Patient                 @relation(fields: [patientId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  prescriptions       Prescription[]
+  invoices            Invoice[]
+  diagnoses           Diagnosis[]
+  investigationOrders InvestigationOrder[]
+  amendments          ConsultationAmendment[]
+
+  @@index([clinicId, patientId, createdAt])
+  @@index([clinicId, doctorId, createdAt])
+  @@map("consultations")
+}
+
+/// Structured diagnosis entries for a Consultation (Clinical Record
+/// upgrade, docs/DATABASE.md §16). Additive alongside — not a replacement
+/// for — `Consultation.diagnosis`, which stays as the doctor's free-text
+/// summary; these rows are the repeatable, typed "Diagnosis" stage of the
+/// Clinical encounter -> Observations -> Diagnosis -> Treatment ->
+/// Prescription -> Investigation orders -> Follow-up pipeline. Only ever
+/// written by an authenticated clinician through DiagnosesService — no
+/// autonomous/AI diagnosis path exists anywhere in this codebase.
+/// clinicId/doctorId denormalized off the Consultation, same onDelete:
+/// NoAction rationale as Prescription's own doc comment.
+model Diagnosis {
+  id             String @id @default(uuid())
+  clinicId       String
+  consultationId String
+  doctorId       String
+
+  /// One of: PRIMARY, SECONDARY, DIFFERENTIAL
+  type        String  @db.NVarChar(20)
+  description String  @db.NVarChar(500)
+  /// Optional ICD-10/11 code — free text, no coding-system validation yet.
+  icdCode     String? @db.NVarChar(20)
+  sortOrder   Int     @default(0)
+
+  createdByUserId String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  consultation Consultation @relation(fields: [consultationId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([clinicId, consultationId, sortOrder])
+  @@map("diagnoses")
+}
+
+/// Structured investigation (lab/imaging/etc.) order for a Consultation —
+/// the "Investigation orders" pipeline stage, and deliberately the piece
+/// that "prepares the architecture" for a future Lab module without
+/// building one now: `status` intentionally stops at ORDERED/CANCELLED,
+/// with no RESULT/COMPLETED state — a future Lab module adds its own
+/// `LabResult` row referencing `InvestigationOrder.id` plus a richer
+/// status enum, needing no change here. `Consultation.investigations`
+/// (free text) is untouched, kept as narrative summary alongside these.
+/// clinicId/doctorId denormalized off the Consultation, same onDelete:
+/// NoAction rationale as Prescription's own doc comment.
+model InvestigationOrder {
+  id             String @id @default(uuid())
+  clinicId       String
+  consultationId String
+  doctorId       String
+
+  /// Free text, e.g. "Complete Blood Count", "Chest X-Ray" — no fixed
+  /// test catalog yet, same "do not build a complete medical database"
+  /// rationale as Medicine.
+  testName      String  @db.NVarChar(200)
+  /// Free text, e.g. "Lab", "Imaging", "Other" — no fixed taxonomy yet.
+  category      String? @db.NVarChar(50)
+  /// One of: ROUTINE, URGENT
+  priority      String  @default("ROUTINE") @db.NVarChar(20)
+  clinicalNotes String? @db.NVarChar(500)
+  /// One of: ORDERED, CANCELLED — see model doc comment above.
+  status        String  @default("ORDERED") @db.NVarChar(20)
+
+  createdByUserId String
+  cancelledAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  consultation Consultation @relation(fields: [consultationId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  /// Reserved, unused back-relation for InvoiceItem.investigationOrderId
+  /// (docs/DATABASE.md §18) — no lab/radiology-billing integration reads
+  /// or writes this yet.
+  invoiceItems InvoiceItem[]
+
+  @@index([clinicId, consultationId, createdAt])
+  @@map("investigation_orders")
+}
+
+/// Append-only clinical-correction history for a locked (COMPLETED)
+/// Consultation — the "controlled amendment" mechanism (docs/DATABASE.md
+/// §16). Distinct from the platform `AuditLog`: `AuditLog` never stores
+/// clinical payloads (docs/SECURITY.md §8), but an amendment's own
+/// previous values *are* clinical-record history, so they live here, in
+/// the clinical domain, not the generic audit table. `AuditService.
+/// record(CONSULTATION_AMENDED)` is still written alongside every row
+/// here (field names only) so the platform audit trail also reflects
+/// that an amendment happened. Never updated/deleted once written.
+model ConsultationAmendment {
+  id             String @id @default(uuid())
+  clinicId       String
+  consultationId String
+
+  amendedByUserId String
+  reason          String @db.NVarChar(500)
+  /// Comma-separated field names changed by this amendment.
+  changedFields   String @db.NVarChar(500)
+  /// JSON snapshot of only the changed fields' previous values.
+  previousValues  String @db.NVarChar(4000)
+
+  createdAt DateTime @default(now())
+
+  consultation Consultation @relation(fields: [consultationId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([clinicId, consultationId, createdAt])
+  @@map("consultation_amendments")
+}
+
+/// Formulary catalog entry (Phase 5). Clinic-scoped, not a shared global
+/// database — deliberately minimal fields (no dosage-form ontology, no drug
+/// interaction data): "do not attempt to create a complete medical database"
+/// per the task brief. `isActive` supports retiring an entry from search
+/// without breaking historical PrescriptionItem rows that still reference
+/// it (medicineId FK is NoAction, never cascaded/deleted).
+model Medicine {
+  id           String   @id @default(uuid())
+  clinicId     String
+  name         String
+  genericName  String?
+  /// e.g. "500mg", "5ml" — free text, not a structured unit/quantity pair.
+  strength     String?
+  /// One of: TABLET, CAPSULE, SYRUP, INJECTION, OINTMENT, DROPS, INHALER, OTHER
+  form         String?  @db.NVarChar(30)
+  manufacturer String?
+  /// Internal SKU/stock code (task brief: "SKU/code") — the inventory
+  /// lookup key, distinct from `id`. Nullable: existing formulary entries
+  /// predate inventory tracking, and not every clinic assigns one.
+  /// Deliberately no DB-level uniqueness (SQL Server's unique index allows
+  /// only one NULL per composite, unlike `[clinicId, name, strength]`
+  /// above whose nullable `strength` already accepts that trade-off) —
+  /// PharmacyInventoryService checks for a clash within the clinic at the
+  /// application layer before assigning one.
+  sku          String?  @db.NVarChar(50)
+  /// Stock/dispensing unit medicine quantities are counted in, e.g.
+  /// "TABLET", "BOTTLE", "STRIP", "VIAL", "TUBE" — distinct from `form`
+  /// (the clinical dosage form): a syrup's `form` is "SYRUP" but its
+  /// inventory `unit` is "BOTTLE". Free text, same convention as `form`.
+  unit         String?  @db.NVarChar(20)
+  notes        String?  @db.NVarChar(500)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  prescriptionItems PrescriptionItem[]
+  /// Pharmacy module (below): this catalog entry is the single source of
+  /// truth every inventory/purchase/stock/dispensing row references by
+  /// `medicineId` — none of those duplicate name/generic/strength/etc.
+  batches           MedicineBatch[]
+  purchaseItems     PurchaseItem[]
+  stockMovements    StockMovement[]
+  dispenseItems     PharmacyDispenseItem[]
+
+  @@unique([clinicId, name, strength])
+  @@index([clinicId, isActive])
+  @@index([clinicId, name])
+  @@index([clinicId, sku])
+  @@map("medicines")
+}
+
+/// A prescription belongs to a Consultation. Modeled as an append-only
+/// version chain rather than in-place edits once finalized (task brief:
+/// "a finalized prescription must be protected from accidental
+/// modification... use an explicit amendment/version strategy"):
+/// - DRAFT: doctor is actively building it, items are freely editable.
+/// - FINALIZED: immutable — items can no longer change.
+/// - SUPERSEDED: a FINALIZED prescription that has since been amended;
+///   `amendsId` on the newer row points back at the one it replaces.
+/// clinicId/doctorId/patientId are denormalized off the Consultation, same
+/// onDelete: NoAction rationale as Consultation itself (see note above).
+model Prescription {
+  id             String @id @default(uuid())
+  clinicId       String
+  consultationId String
+  doctorId       String
+  patientId      String
+
+  /// One of: DRAFT, FINALIZED, SUPERSEDED
+  status  String @default("DRAFT") @db.NVarChar(20)
+  /// 1 for the original prescription in a consultation; incremented by one
+  /// for each amendment in the chain.
+  version Int    @default(1)
+
+  notes           String?   @db.NVarChar(1000)
+  createdByUserId String
+  finalizedAt     DateTime?
+  supersededAt    DateTime?
+
+  /// Soft delete (docs/DATABASE.md §8 names prescriptions explicitly).
+  deletedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  consultation Consultation @relation(fields: [consultationId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  doctor       Doctor       @relation(fields: [doctorId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  patient      Patient      @relation(fields: [patientId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  /// The prescription this one amends (null for the original in the chain).
+  /// @unique enforces "at most one amendment per prescription".
+  amendsId  String?       @unique
+  amends    Prescription? @relation("PrescriptionAmendment", fields: [amendsId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  amendedBy Prescription? @relation("PrescriptionAmendment")
+
+  items             PrescriptionItem[]
+  /// Pharmacy module (below): dispensing events fulfilled against this
+  /// prescription.
+  pharmacyDispenses PharmacyDispense[]
+  /// Reserved, unused back-relation for InvoiceItem.prescriptionId
+  /// (docs/DATABASE.md §18) — no pharmacy-billing integration reads or
+  /// writes this yet.
+  invoiceItems      InvoiceItem[]
+
+  @@index([clinicId, consultationId, createdAt])
+  @@index([clinicId, patientId, createdAt])
+  @@index([clinicId, doctorId, createdAt])
+  @@map("prescriptions")
+}
+
+/// Carries no `clinicId` column — audited in the 2026-09-08 safety
+/// migration (docs/DATABASE.md §7) and deliberately kept that way: every
+/// read/write of a PrescriptionItem goes through its `prescriptionId`,
+/// already verified against `clinicId` one level up
+/// (`PrescriptionsService.findActiveRowOrThrow` + `scoped-write.util.ts`),
+/// so a denormalized `clinicId` here would duplicate data no query path
+/// needs and would itself require a backfill migration to add for no
+/// query-performance or tenant-isolation benefit — see the existing doc
+/// comment on `scoped-write.util.ts` for the pattern this follows. See
+/// `InvoiceItem` below for the identical finding.
+///
+/// One prescribed medicine line within a Prescription. `medicineName` is a
+/// denormalized snapshot of Medicine.name at prescribing time so a later
+/// rename/deactivation of the catalog entry never changes what a
+/// historical, finalized prescription reads.
+model PrescriptionItem {
+  id             String   @id @default(uuid())
+  prescriptionId String
+  medicineId     String
+  medicineName   String
+  dosage         String   @db.NVarChar(100)
+  frequency      String   @db.NVarChar(100)
+  duration       String   @db.NVarChar(100)
+  /// One of: ORAL, TOPICAL, INTRAVENOUS, INTRAMUSCULAR, SUBCUTANEOUS, INHALED, OTHER
+  route          String?  @db.NVarChar(50)
+  instructions   String?  @db.NVarChar(500)
+  sortOrder      Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  prescription  Prescription           @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
+  medicine      Medicine               @relation(fields: [medicineId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  /// Pharmacy module (below): dispense-item rows that fulfilled this
+  /// prescribed line, when dispensing was linked back to it.
+  dispenseItems PharmacyDispenseItem[]
+
+  @@index([prescriptionId])
+  @@index([medicineId])
+  @@map("prescription_items")
+}
+
+// ---------------------------------------------------------------------------
+// Pharmacy: Inventory / Purchase / Stock / Dispensing (Phase 5 follow-up).
+//
+// Deliberately layered as its own chain off the existing Medicine catalog
+// above, per the task brief:
+//   Medicine Master -> Inventory -> Purchase -> Stock -> Dispensing -> Prescription
+// `Medicine` (catalog identity: name/genericName/strength/form/
+// manufacturer/sku/unit/isActive) is NOT duplicated anywhere below — every
+// model here references it by `medicineId` only. No online-ordering/
+// supplier-workflow models (task brief excludes "online pharmacy
+// ordering") and no billing/invoice linkage yet (task brief: "do not
+// integrate billing yet" — `sellingPrice`/`unitPrice` are captured now so
+// that integration has data to read later, not used for billing here).
+//
+// Branch isolation follows the same "optional branchId, added without a
+// backfill" convention as `ClinicMembership.branchId` (see Branch's own
+// doc comment) rather than Appointment's "no branchId at all yet": pharmacy
+// stock is physically located somewhere, so every model below carries it
+// from day one, nullable for clinics that don't yet use branches.
+// ---------------------------------------------------------------------------
+
+/// One received batch of a Medicine — the Inventory layer. Batch/expiry/
+/// price are tracked per batch, never collapsed into a single running
+/// total on `Medicine` itself (task brief: "do not represent inventory
+/// only as a single quantity field"). `quantityOnHand` is this batch's own
+/// current balance; it is mutated only inside the same transaction as the
+/// `StockMovement` row that explains the change (PurchasesService /
+/// StockMovementsService / DispensingService) — never written directly
+/// from a controller or DTO.
+model MedicineBatch {
+  id         String  @id @default(uuid())
+  clinicId   String
+  branchId   String?
+  medicineId String
+
+  batchNumber String   @db.NVarChar(100)
+  expiryDate  DateTime @db.Date
+
+  /// Quantity originally received into this batch. Informational — the
+  /// authoritative running balance is `quantityOnHand`, not a value
+  /// derived from this at read time.
+  quantityReceived Int
+  /// Current on-hand balance for this batch, in `Medicine.unit` units.
+  quantityOnHand   Int
+
+  /// Cost price per unit paid to the supplier for this batch.
+  purchasePrice Decimal @db.Decimal(10, 2)
+  /// Price per unit this batch is dispensed at. Captured for a future
+  /// billing integration (out of scope here).
+  sellingPrice  Decimal @db.Decimal(10, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  medicine      Medicine        @relation(fields: [medicineId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  branch        Branch?         @relation(fields: [branchId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  purchaseItems PurchaseItem[]
+  movements     StockMovement[]
+
+  @@unique([clinicId, medicineId, branchId, batchNumber])
+  @@index([clinicId, medicineId, expiryDate])
+  @@index([clinicId, branchId])
+  @@index([clinicId, expiryDate])
+  @@map("medicine_batches")
+}
+
+/// A single stock-receipt event — the Purchase layer, between Medicine
+/// Master/Inventory and Stock. Deliberately no supplier master or PO
+/// workflow (draft/approve/order-and-await-delivery): this only records
+/// what was physically received into inventory, matching the task brief's
+/// "do not implement online pharmacy ordering". Each `PurchaseItem` line
+/// creates or restocks exactly one `MedicineBatch` and writes one PURCHASE
+/// `StockMovement` in the same transaction (`PurchasesService.create`).
+model PurchaseInvoice {
+  id       String  @id @default(uuid())
+  clinicId String
+  branchId String?
+
+  /// Free-text supplier identity — no separate Supplier master (task
+  /// brief scope: record receipts, not manage vendors).
+  supplierName  String   @db.NVarChar(200)
+  invoiceNumber String?  @db.NVarChar(100)
+  purchaseDate  DateTime @db.Date
+  notes         String?  @db.NVarChar(500)
+
+  createdByUserId String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branch Branch?        @relation(fields: [branchId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  items  PurchaseItem[]
+
+  @@index([clinicId, purchaseDate])
+  @@index([clinicId, branchId])
+  @@map("purchase_invoices")
+}
+
+/// One received batch line within a PurchaseInvoice. Carries no `clinicId`
+/// column — verified one level up via `purchaseId`, same "denormalized
+/// clinicId would duplicate data no query path needs" reasoning as
+/// `PrescriptionItem`/`InvoiceItem` (see those models' notes).
+/// `medicineName` is a point-in-time snapshot, same convention as
+/// `PrescriptionItem.medicineName`.
+model PurchaseItem {
+  id           String @id @default(uuid())
+  purchaseId   String
+  medicineId   String
+  medicineName String
+
+  batchId       String
+  batchNumber   String   @db.NVarChar(100)
+  expiryDate    DateTime @db.Date
+  quantity      Int
+  purchasePrice Decimal  @db.Decimal(10, 2)
+  sellingPrice  Decimal  @db.Decimal(10, 2)
+
+  createdAt DateTime @default(now())
+
+  purchase PurchaseInvoice @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  medicine Medicine        @relation(fields: [medicineId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  batch    MedicineBatch   @relation(fields: [batchId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([purchaseId])
+  @@index([medicineId])
+  @@index([batchId])
+  @@map("purchase_items")
+}
+
+/// Append-only stock ledger — the Stock layer (task brief: "Stock should
+/// be ledger-like ... every movement must be traceable"). Every change to
+/// any `MedicineBatch.quantityOnHand` is written here, in the same
+/// transaction, with a before/after snapshot. This is the audit trail for
+/// "why does this batch have this quantity" specifically — distinct from
+/// `AuditLog` (who/when at the request level, not stock-balance
+/// mechanics). Rows are never updated or deleted once written.
+model StockMovement {
+  id       String  @id @default(uuid())
+  clinicId String
+  branchId String?
+
+  medicineId String
+  batchId    String
+
+  /// One of: PURCHASE, DISPENSE, RETURN, ADJUSTMENT, EXPIRED, DAMAGED.
+  /// PURCHASE/DISPENSE are written only by PurchasesService/
+  /// DispensingService as part of their own flow; RETURN/ADJUSTMENT/
+  /// EXPIRED/DAMAGED are written by StockMovementsService's manual-entry
+  /// endpoint (a pharmacist correcting/writing off stock).
+  type String @db.NVarChar(20)
+
+  /// Signed delta applied to `quantityOnHand` (positive = stock in,
+  /// negative = stock out). PURCHASE/RETURN are typically positive;
+  /// DISPENSE/EXPIRED/DAMAGED are typically negative; ADJUSTMENT can be
+  /// either, per the recorded reason.
+  quantity       Int
+  quantityBefore Int
+  quantityAfter  Int
+
+  /// What business event caused this movement — one of: PURCHASE,
+  /// DISPENSE, MANUAL. Together with `referenceId` this is how a movement
+  /// traces back to its origin (a PurchaseItem id, a
+  /// PharmacyDispenseItem id, or nothing for a manual entry).
+  referenceType String? @db.NVarChar(30)
+  referenceId   String?
+
+  /// Free-text reason. Required at the DTO layer for RETURN/ADJUSTMENT/
+  /// EXPIRED/DAMAGED (never required for system-generated PURCHASE/
+  /// DISPENSE, which already carry a `referenceId`).
+  reason String? @db.NVarChar(500)
+
+  performedByUserId String
+
+  createdAt DateTime @default(now())
+
+  medicine Medicine      @relation(fields: [medicineId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  batch    MedicineBatch @relation(fields: [batchId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  branch   Branch?       @relation(fields: [branchId], references: [id])
+
+  @@index([clinicId, medicineId, createdAt])
+  @@index([clinicId, batchId, createdAt])
+  @@index([clinicId, type, createdAt])
+  @@index([clinicId, referenceType, referenceId])
+  @@map("stock_movements")
+}
+
+/// A single dispensing event at the pharmacy counter — the Dispensing
+/// layer, the last stage before (optional) billing. `prescriptionId` links
+/// to a FINALIZED `Prescription` when dispensing against one — the
+/// intended, primary path ("prepare for prescription dispensing" per the
+/// task brief) — and is nullable to also allow an over-the-counter/
+/// walk-in dispense with no prescription. Carries no invoice/payment
+/// reference: billing integration is explicitly out of scope here.
+model PharmacyDispense {
+  id       String  @id @default(uuid())
+  clinicId String
+  branchId String?
+
+  patientId      String
+  prescriptionId String?
+
+  /// One of: COMPLETED, RETURNED. A return of an already-completed
+  /// dispense is recorded as new RETURN `StockMovement` rows, not an
+  /// in-place edit of this row's items — see `StockMovement`.
+  status String @default("COMPLETED") @db.NVarChar(20)
+
+  dispensedByUserId String
+  dispensedAt       DateTime @default(now())
+  notes             String?  @db.NVarChar(500)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  patient      Patient                @relation(fields: [patientId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  prescription Prescription?          @relation(fields: [prescriptionId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  branch       Branch?                @relation(fields: [branchId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  items        PharmacyDispenseItem[]
+
+  @@index([clinicId, patientId, dispensedAt])
+  @@index([clinicId, prescriptionId])
+  @@index([clinicId, dispensedAt])
+  @@map("pharmacy_dispenses")
+}
+
+/// One dispensed medicine line. Carries no `clinicId` (verified one level
+/// up via `dispenseId`, same convention as `PrescriptionItem`/
+/// `PurchaseItem`). Which batch(es) actually fulfilled this line's
+/// quantity — FEFO (first-expiry-first-out) allocation, possibly split
+/// across more than one batch — is recorded as `StockMovement` rows
+/// referencing this row's id (`referenceType` DISPENSE, `referenceId` =
+/// this id), not duplicated here: one line can legitimately draw from
+/// multiple batches.
+model PharmacyDispenseItem {
+  id           String @id @default(uuid())
+  dispenseId   String
+  medicineId   String
+  medicineName String
+
+  /// Optional link back to the specific prescribed line this fulfills.
+  /// No `onDelete` cascade concern: `PrescriptionItem` rows are never
+  /// deleted once a prescription is finalized (only amended via a new
+  /// prescription version).
+  prescriptionItemId String?
+
+  quantity  Int
+  /// Snapshot of the (quantity-weighted average, if split across batches)
+  /// selling price actually applied. Captured for a future billing
+  /// integration — not used for billing here.
+  unitPrice Decimal @db.Decimal(10, 2)
+
+  createdAt DateTime @default(now())
+
+  dispense         PharmacyDispense  @relation(fields: [dispenseId], references: [id], onDelete: Cascade)
+  medicine         Medicine          @relation(fields: [medicineId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  prescriptionItem PrescriptionItem? @relation(fields: [prescriptionItemId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([dispenseId])
+  @@index([medicineId])
+  @@index([prescriptionItemId])
+  @@map("pharmacy_dispense_items")
+}
+
+/// Append-only financial audit trail (Phase 6), spec'd in docs/DATABASE.md
+/// §9 since Phase 1 but built here, first triggered by billing writes.
+/// `changedFields` is a short, non-sensitive description (field names /
+/// status transition, never a full payload dump) per docs/SECURITY.md §8.
+/// No soft delete: an audit row is immutable and never removed.
+/// clinicId is nullable to represent a platform-level action (no clinic
+/// exists yet, e.g. clinic creation itself, or the action applies to no
+/// single clinic) — actorType distinguishes the two shapes:
+///   - Tenant action:   clinicId = the acting clinic, actorType = TENANT_USER
+///   - Platform action: clinicId = null,              actorType = PLATFORM_USER
+/// actorType is a plain String, not a Prisma enum (sqlserver connector has
+/// no native enum support, same convention as every other status column in
+/// this schema) — allowed values: PLATFORM_USER | TENANT_USER, validated at
+/// the application layer (AuditService).
+///
+/// Phase 1F adds request-correlation/network metadata (requestId/
+/// ipAddress/userAgent) — all optional and best-effort (never populated
+/// from anything the caller could spoof into meaning something else, and
+/// never a substitute for the `entity`/`action` business fact). None of
+/// these three, nor `changedFields`, may ever hold a password, an access/
+/// refresh token, or a full clinical record — see AuditService's own doc
+/// comment. Deliberately has no relation to User/Clinic/Branch/Department:
+/// this table must survive the deletion/archival of any of those (e.g. a
+/// clinical-history purge) as the durable record that the action happened,
+/// so it is never a cascade target — see docs/DATABASE.md §9.
+model AuditLog {
+  id            String   @id @default(uuid())
+  clinicId      String?
+  actorUserId   String
+  actorType     String   @default("TENANT_USER")
+  entity        String
+  entityId      String
+  action        String
+  changedFields String?  @db.NVarChar(2000)
+  /// Correlates one AuditLog row (or several, for a multi-write business
+  /// transaction) back to the originating HTTP request — RequestIdMiddleware's
+  /// X-Request-Id, echoed by nestjs-pino as the same request's log lines.
+  requestId     String?  @db.NVarChar(100)
+  /// Caller's network address, where the write path runs inside an HTTP
+  /// request (some are cron/system-triggered and have none — left null).
+  ipAddress     String?  @db.NVarChar(64)
+  userAgent     String?  @db.NVarChar(255)
+  createdAt     DateTime @default(now())
+
+  @@index([clinicId, entity, entityId])
+  @@index([clinicId, createdAt])
+  /// Already added in Phase 1F — re-verified current, not duplicated, by
+  /// the 2026-09-08 safety migration audit (docs/DATABASE.md §7/§9): the
+  /// SA-05 viewer's most common single-column filter ("what did this user
+  /// do") is covered.
+  @@index([actorUserId])
+  @@map("audit_logs")
+}
+
+/// One invoice per Consultation while active (DRAFT/ISSUED/PARTIALLY_PAID/
+/// PAID) — workflow is Consultation -> Invoice -> Payment -> Receipt (task
+/// brief). clinicId/doctorId/patientId denormalized off the Consultation,
+/// same onDelete: NoAction rationale as Prescription (see its doc comment).
+///
+/// DRAFT items are freely editable; `issue()` locks them and computes
+/// subtotal/discountAmount/taxAmount/totalAmount from the InvoiceItem rows
+/// at that moment — deliberately not an amendment/version chain like
+/// Prescription: the task brief asks for an audited in-place "invoice
+/// modification", not a version chain.
+model Invoice {
+  id             String @id @default(uuid())
+  clinicId       String
+  consultationId String
+  doctorId       String
+  patientId      String
+
+  /// Human-facing, assigned at issue time (e.g. "INV-000123"). Null while DRAFT.
+  invoiceNumber String?
+
+  /// One of: DRAFT, ISSUED, PARTIALLY_PAID, PAID, VOID
+  status String @default("DRAFT") @db.NVarChar(20)
+
+  /// Decimal(10,2): currency amounts, never a float (rounding). All zero
+  /// until `issue()` computes them from InvoiceItem rows.
+  subtotal       Decimal @default(0) @db.Decimal(10, 2)
+  discountAmount Decimal @default(0) @db.Decimal(10, 2)
+  taxAmount      Decimal @default(0) @db.Decimal(10, 2)
+  totalAmount    Decimal @default(0) @db.Decimal(10, 2)
+  /// Running total of COMPLETED payments minus refunds against this invoice.
+  amountPaid     Decimal @default(0) @db.Decimal(10, 2)
+
+  notes           String?   @db.NVarChar(1000)
+  createdByUserId String
+  issuedAt        DateTime?
+  dueDate         DateTime? @db.Date
+  voidedAt        DateTime?
+
+  /// Soft delete (docs/DATABASE.md §8 names invoices explicitly).
+  deletedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  consultation Consultation @relation(fields: [consultationId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  doctor       Doctor       @relation(fields: [doctorId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  patient      Patient      @relation(fields: [patientId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  items    InvoiceItem[]
+  payments Payment[]
+
+  @@unique([clinicId, invoiceNumber])
+  @@index([clinicId, consultationId])
+  @@index([clinicId, patientId, createdAt])
+  @@index([clinicId, doctorId, createdAt])
+  @@index([clinicId, status])
+  @@map("invoices")
+}
+
+/// Carries no `clinicId` column — same audited-and-kept finding as
+/// `PrescriptionItem` above (docs/DATABASE.md §7 safety migration,
+/// 2026-09-08): every read/write goes through `invoiceId`, already
+/// verified against `clinicId` one level up
+/// (`InvoicesService.findActiveRowOrThrow` + `scoped-write.util.ts`).
+///
+/// One chargeable-service line within an Invoice — the generalized
+/// "charge" concept a consultation fee, a procedure, a lab/radiology
+/// order, a pharmacy dispense, a room charge, nursing, or a free-form
+/// other charge all flow through (docs/DATABASE.md §18). `itemType` is
+/// the single categorization tag for that taxonomy — see
+/// `INVOICE_ITEM_TYPES` (`billing/dto/create-invoice-item.dto.ts`), the
+/// one exported source of truth every writer validates against; nothing
+/// branches business logic on its value beyond storage/display. Widening
+/// that vocabulary is a DTO-level change only — this column has no DB
+/// check constraint — and never rewrites a historical row: an item
+/// written under the old `CONSULTATION_FEE`/`PRESCRIPTION` values keeps
+/// that value forever, it's just no longer offered on new writes.
+/// `taxRatePercent` is entered per line at creation time rather than a
+/// clinic-wide tax-rules table (task brief: "tax configuration if
+/// required" — kept minimal, no engine built for a rule that isn't
+/// needed yet). `lineTotal` is server-computed:
+/// (quantity * unitPrice - discountAmount) * (1 + taxRatePercent / 100),
+/// rounded to 2dp, and is a snapshot — never recomputed retroactively if
+/// tax/discount inputs would otherwise change after issue.
+model InvoiceItem {
+  id          String @id @default(uuid())
+  invoiceId   String
+  description String @db.NVarChar(500)
+
+  /// One of: CONSULTATION, PROCEDURE, LABORATORY, RADIOLOGY, PHARMACY,
+  /// ROOM, NURSING, OTHER — plus two legacy values still readable on
+  /// historical rows but no longer written: CONSULTATION_FEE, PRESCRIPTION.
+  itemType String @default("OTHER") @db.NVarChar(20)
+
+  /// Reserved for a future pharmacy-charge line to point at the
+  /// prescription it was billed from. Not yet populated or read by any
+  /// service — schema-only prep, added ahead of the actual integration
+  /// (docs/DATABASE.md §18).
+  prescriptionId String?
+  /// Reserved for a future lab/radiology-charge line to point at the
+  /// investigation order it was billed from. Same status as
+  /// `prescriptionId` above.
+  investigationOrderId String?
+
+  quantity       Int     @default(1)
+  unitPrice      Decimal @db.Decimal(10, 2)
+  discountAmount Decimal @default(0) @db.Decimal(10, 2)
+  taxRatePercent Decimal @default(0) @db.Decimal(5, 2)
+  lineTotal      Decimal @db.Decimal(10, 2)
+
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoice            Invoice             @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  prescription       Prescription?       @relation(fields: [prescriptionId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  investigationOrder InvestigationOrder? @relation(fields: [investigationOrderId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([invoiceId])
+  @@index([prescriptionId])
+  @@index([investigationOrderId])
+  @@map("invoice_items")
+}
+
+/// A payment captured against an Invoice via the PaymentProvider
+/// abstraction (src/billing/payment-providers) — today only
+/// ManualPaymentProvider (staff records an already-completed CASH/UPI/
+/// CARD/OTHER transaction), designed so an online gateway can be added as
+/// a second provider later without changing PaymentsService's call sites
+/// (task brief). No soft delete: a financial ledger row is never removed —
+/// corrections happen via Refund.
+model Payment {
+  id        String @id @default(uuid())
+  clinicId  String
+  invoiceId String
+
+  amount Decimal @db.Decimal(10, 2)
+
+  /// One of: CASH, UPI, CARD, OTHER
+  method String @db.NVarChar(20)
+  /// One of: PENDING, COMPLETED, FAILED, REFUNDED, PARTIALLY_REFUNDED
+  status String @default("PENDING") @db.NVarChar(20)
+
+  /// Opaque reference from the capturing PaymentProvider (e.g. a UPI
+  /// transaction ID staff types in, or a future gateway's charge ID).
+  providerReference String?
+  /// Human-facing, assigned once status becomes COMPLETED (e.g. "RCPT-000123").
+  receiptNumber     String?
+
+  receivedByUserId String
+  paidAt           DateTime?
+  notes            String?   @db.NVarChar(500)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoice Invoice  @relation(fields: [invoiceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  refunds Refund[]
+
+  @@unique([clinicId, receiptNumber])
+  @@index([clinicId, invoiceId])
+  @@index([clinicId, status])
+  @@map("payments")
+}
+
+/// A refund against a COMPLETED (or PARTIALLY_REFUNDED) Payment. Always
+/// recorded as COMPLETED immediately (no online gateway to await a
+/// callback from yet — see Payment's doc comment), amount capped at the
+/// payment's remaining unrefunded balance, service-layer enforced.
+model Refund {
+  id        String @id @default(uuid())
+  clinicId  String
+  paymentId String
+
+  amount Decimal @db.Decimal(10, 2)
+  reason String  @db.NVarChar(500)
+
+  /// One of: PENDING, COMPLETED, FAILED
+  status String @default("COMPLETED") @db.NVarChar(20)
+
+  processedByUserId String
+  processedAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([clinicId, paymentId])
+  @@map("refunds")
+}
+
+/// Phase 7 (support systems): an in-app notification for one recipient user
+/// (doctor or patient) — a comms/support-table row, not a clinical/
+/// financial record, so it deliberately has no AuditLog write path
+/// (docs/DATABASE.md §9 scopes audit requirements to clinical/financial
+/// tables) and no soft delete (not in docs/DATABASE.md §8's explicit
+/// soft-delete list). `userId` is a plain FK column with no Prisma relation
+/// object, same convention as Appointment/Invoice/Prescription's
+/// `createdByUserId` — see the note on model User.
+model Notification {
+  id       String @id @default(uuid())
+  clinicId String
+  userId   String
+
+  /// One of: APPOINTMENT_BOOKED, APPOINTMENT_CONFIRMED, APPOINTMENT_CANCELLED,
+  /// APPOINTMENT_REMINDER, PRESCRIPTION_READY, FOLLOW_UP_REMINDER, GENERAL.
+  /// APPOINTMENT_REMINDER/FOLLOW_UP_REMINDER are emitted by the Phase 8
+  /// hourly reminder cron (notifications/reminder.service.ts).
+  type  String @db.NVarChar(30)
+  title String @db.NVarChar(200)
+  body  String @db.NVarChar(1000)
+
+  /// Loose pointer back to the entity this notification is about (e.g.
+  /// "Appointment"/<id>) — no Prisma relation, purely informational for the
+  /// client to deep-link with. Also doubles as the idempotency key for the
+  /// reminder cron (docs/DECISIONS.md ADR-008): before creating a reminder,
+  /// the cron checks for an existing row with this (type, relatedEntityId).
+  relatedEntityType String? @db.NVarChar(50)
+  relatedEntityId   String?
+
+  readAt DateTime?
+
+  /// Push-delivery tracking (Phase 8 — docs/DECISIONS.md ADR-008). The
+  /// in-app row above is written synchronously; these columns are updated
+  /// asynchronously by the notification-delivery worker after it calls the
+  /// bound NotificationProvider. One of: PENDING, SENT, FAILED, SKIPPED
+  /// (SKIPPED = no NotificationProvider had anything to deliver to, e.g. no
+  /// registered device token — not an error).
+  pushStatus    String    @default("PENDING") @db.NVarChar(20)
+  pushAttempts  Int       @default(0)
+  pushSentAt    DateTime?
+  pushLastError String?   @db.NVarChar(500)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clinicId, userId, createdAt])
+  @@index([clinicId, type, relatedEntityId])
+  @@map("notifications")
+}
+
+/// A registered push-notification target for a User (Phase 8 —
+/// docs/DECISIONS.md ADR-008): one row per device/app-install that has
+/// opted in, populated by the mobile client calling
+/// `POST /notifications/device-tokens` after requesting FCM permission.
+/// Global, not tenant-scoped: a User's device is the same physical device
+/// across whichever clinic membership is active, so `clinicId` would only
+/// ever duplicate rows without adding any access-control meaning — the
+/// token is looked up by userId alone (FcmNotificationProvider), never
+/// exposed through any list/read endpoint.
+model UserDeviceToken {
+  id        String   @id @default(uuid())
+  userId    String
+  token     String   @unique
+  /// One of: IOS, ANDROID, WEB
+  platform  String   @db.NVarChar(20)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@map("user_device_tokens")
+}
+
+/// Phase 7 (support systems): a clinical/administrative document uploaded
+/// against a Patient (lab report, imaging, referral letter, insurance,
+/// other). Soft-deletable per docs/DATABASE.md §8's explicit list.
+/// `storageKey` is the server-internal on-disk path — never included in any
+/// API response DTO (docs/SECURITY.md §9). `uploadedByUserId` is a plain FK
+/// column with no Prisma relation, same convention as
+/// Notification.userId/Invoice.createdByUserId above.
+model Document {
+  id               String @id @default(uuid())
+  clinicId         String
+  patientId        String
+  uploadedByUserId String
+
+  /// One of: LAB_REPORT, IMAGING, REFERRAL_LETTER, INSURANCE, OTHER
+  category String @db.NVarChar(30)
+
+  /// Original filename, sanitized — never trusted as an on-disk path.
+  fileName  String @db.NVarChar(255)
+  mimeType  String @db.NVarChar(100)
+  sizeBytes Int
+
+  /// Server-internal storage path/key under `documentsStorageDir`
+  /// (src/config/configuration.ts) — never returned to a client.
+  storageKey String @db.NVarChar(500)
+
+  notes String? @db.NVarChar(1000)
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([clinicId, patientId, createdAt])
+  @@map("documents")
 }

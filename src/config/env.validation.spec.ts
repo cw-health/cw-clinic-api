@@ -8,6 +8,8 @@ describe('validateEnvironment', () => {
     CORS_ORIGINS: 'http://localhost:5173',
     THROTTLE_TTL_MS: '60000',
     THROTTLE_LIMIT: '100',
+    JWT_ACCESS_SECRET: 'test-access-secret',
+    JWT_REFRESH_SECRET: 'test-refresh-secret',
   };
 
   it('accepts a valid configuration and coerces types', () => {
@@ -36,5 +38,15 @@ describe('validateEnvironment', () => {
     expect(() => validateEnvironment({ ...validConfig, PORT: '' })).toThrow(
       /Environment validation failed/,
     );
+  });
+
+  it('defaults DOCUMENTS_STORAGE_DIR when not set', () => {
+    const result = validateEnvironment(validConfig);
+    expect(result.DOCUMENTS_STORAGE_DIR).toBe('./storage/documents');
+  });
+
+  it('accepts a custom DOCUMENTS_STORAGE_DIR', () => {
+    const result = validateEnvironment({ ...validConfig, DOCUMENTS_STORAGE_DIR: '/data/docs' });
+    expect(result.DOCUMENTS_STORAGE_DIR).toBe('/data/docs');
   });
 });

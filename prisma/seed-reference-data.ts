@@ -1,6 +1,7 @@
 import { PrismaClient } from '@prisma/client';
 import { PERMISSIONS } from './data/permissions';
 import { ROLE_TEMPLATES } from './data/role-templates';
+import { SPECIALIZATIONS } from './data/specializations';
 
 /**
  * Idempotent: safe to run repeatedly. Seeds only platform reference data
@@ -49,5 +50,9 @@ export async function seedReferenceData(prisma: PrismaClient): Promise<void> {
         data: permissions.map((permission) => ({ roleId: role.id, permissionId: permission.id })),
       }),
     ]);
+  }
+
+  for (const name of SPECIALIZATIONS) {
+    await prisma.specialization.upsert({ where: { name }, update: {}, create: { name } });
   }
 }

@@ -6,6 +6,7 @@ import {
   HealthCheckService,
   MemoryHealthIndicator,
 } from '@nestjs/terminus';
+import { Public } from '../auth/decorators/public.decorator';
 import { PrismaHealthIndicator } from './indicators/prisma-health.indicator';
 
 @ApiTags('health')
@@ -18,6 +19,9 @@ export class HealthController {
     private readonly disk: DiskHealthIndicator,
   ) {}
 
+  // Liveness/readiness probe — infra checks this without a token, so it
+  // must stay exempt from the global JwtAuthGuard.
+  @Public()
   @Get('/live')
   @HealthCheck()
   check() {

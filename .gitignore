@@ -8,3 +8,6 @@ build/
 *.log
 coverage/
 .DS_Store
+
+# Local-disk document storage (docs/SECURITY.md §9) — never committed.
+/storage/

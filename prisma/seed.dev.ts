@@ -1,21 +1,15 @@
 import { PrismaClient } from '@prisma/client';
-import { randomBytes, scryptSync } from 'node:crypto';
+import { hashPassword } from '../src/auth/password.util';
 import { seedReferenceData } from './seed-reference-data';
 
 /**
  * Development seed path — reference data plus a small fixture clinic and
- * users for local development, per docs/DATABASE.md §5. Never run against
- * a shared/production database.
- *
- * Password hashing here is a Phase-1 placeholder (scrypt) since the auth
- * module (argon2id, per docs/SECURITY.md §1) does not exist yet — dev
- * fixture users are not usable for login until auth ships.
+ * users (one per role) for local development, per docs/DATABASE.md §5.
+ * Never run against a shared/production database. All fixture users share
+ * the password below and use the real auth module hashing (argon2id, per
+ * docs/SECURITY.md §1) so they're directly usable against POST /auth/login.
  */
-function placeholderHash(password: string): string {
-  const salt = randomBytes(16).toString('hex');
-  const hash = scryptSync(password, salt, 64).toString('hex');
-  return `scrypt:${salt}:${hash}`;
-}
+const DEV_PASSWORD = 'DevPassword123!';
 
 async function main(): Promise<void> {
   const prisma = new PrismaClient();
@@ -30,52 +24,103 @@ async function main(): Promise<void> {
       create: { name: 'Dev Clinic', slug: 'dev-clinic', status: 'ACTIVE' },
     });
 
-    const clinicAdminRole = await prisma.role.findFirst({
-      where: { clinicId: null, name: 'ClinicAdmin' },
+    // A second clinic so cross-tenant isolation is actually exercisable
+    // in dev/manual testing, not just asserted in unit tests.
+    const otherClinic = await prisma.clinic.upsert({
+      where: { slug: 'other-clinic' },
+      update: {},
+      create: { name: 'Other Clinic', slug: 'other-clinic', status: 'ACTIVE' },
     });
-    const doctorRole = await prisma.role.findFirst({ where: { clinicId: null, name: 'Doctor' } });
 
-    if (!clinicAdminRole || !doctorRole) {
-      throw new Error('Role templates missing — seedReferenceData must run before fixtures.');
+    const roleNames = ['ClinicAdmin', 'Doctor', 'FrontDesk', 'Patient'] as const;
+    const roles = await prisma.role.findMany({
+      where: { clinicId: null, name: { in: [...roleNames] } },
+    });
+    const roleByName = new Map(roles.map((role) => [role.name, role]));
+    for (const name of roleNames) {
+      if (!roleByName.has(name)) {
+        throw new Error(
+          `Role template "${name}" missing — seedReferenceData must run before fixtures.`,
+        );
+      }
     }
 
-    const admin = await prisma.user.upsert({
-      where: { email: 'admin@dev-clinic.test' },
-      update: {},
-      create: {
-        email: 'admin@dev-clinic.test',
-        passwordHash: placeholderHash('DevPassword123!'),
+    const passwordHash = await hashPassword(DEV_PASSWORD);
+
+    const fixtures: Array<{
+      email: string;
+      firstName: string;
+      lastName: string;
+      role: (typeof roleNames)[number];
+    }> = [
+      { email: 'admin@dev-clinic.test', firstName: 'Dev', lastName: 'Admin', role: 'ClinicAdmin' },
+      { email: 'doctor@dev-clinic.test', firstName: 'Dev', lastName: 'Doctor', role: 'Doctor' },
+      {
+        email: 'receptionist@dev-clinic.test',
         firstName: 'Dev',
+        lastName: 'Receptionist',
+        role: 'FrontDesk',
+      },
+      { email: 'patient@dev-clinic.test', firstName: 'Dev', lastName: 'Patient', role: 'Patient' },
+    ];
+
+    for (const fixture of fixtures) {
+      const user = await prisma.user.upsert({
+        where: { email: fixture.email },
+        update: { passwordHash },
+        create: {
+          email: fixture.email,
+          passwordHash,
+          firstName: fixture.firstName,
+          lastName: fixture.lastName,
+          status: 'ACTIVE',
+        },
+      });
+
+      await prisma.clinicMembership.upsert({
+        where: { userId_clinicId: { userId: user.id, clinicId: clinic.id } },
+        update: {},
+        create: { userId: user.id, clinicId: clinic.id, roleId: roleByName.get(fixture.role)!.id },
+      });
+    }
+
+    // A fixture user who only belongs to the *other* clinic — used to
+    // manually verify cross-tenant denial against `clinic`-scoped data.
+    const otherClinicAdmin = await prisma.user.upsert({
+      where: { email: 'admin@other-clinic.test' },
+      update: { passwordHash },
+      create: {
+        email: 'admin@other-clinic.test',
+        passwordHash,
+        firstName: 'Other',
         lastName: 'Admin',
         status: 'ACTIVE',
       },
     });
-
-    const doctor = await prisma.user.upsert({
-      where: { email: 'doctor@dev-clinic.test' },
+    await prisma.clinicMembership.upsert({
+      where: { userId_clinicId: { userId: otherClinicAdmin.id, clinicId: otherClinic.id } },
       update: {},
       create: {
-        email: 'doctor@dev-clinic.test',
-        passwordHash: placeholderHash('DevPassword123!'),
-        firstName: 'Dev',
-        lastName: 'Doctor',
-        status: 'ACTIVE',
+        userId: otherClinicAdmin.id,
+        clinicId: otherClinic.id,
+        roleId: roleByName.get('ClinicAdmin')!.id,
       },
     });
 
-    await prisma.clinicMembership.upsert({
-      where: { userId_clinicId: { userId: admin.id, clinicId: clinic.id } },
-      update: {},
-      create: { userId: admin.id, clinicId: clinic.id, roleId: clinicAdminRole.id },
+    await prisma.user.upsert({
+      where: { email: 'superadmin@cw-clinic.test' },
+      update: { passwordHash, isSuperAdmin: true },
+      create: {
+        email: 'superadmin@cw-clinic.test',
+        passwordHash,
+        firstName: 'Super',
+        lastName: 'Admin',
+        status: 'ACTIVE',
+        isSuperAdmin: true,
+      },
     });
 
-    await prisma.clinicMembership.upsert({
-      where: { userId_clinicId: { userId: doctor.id, clinicId: clinic.id } },
-      update: {},
-      create: { userId: doctor.id, clinicId: clinic.id, roleId: doctorRole.id },
-    });
-
-    console.log('[seed:dev] done.');
+    console.log(`[seed:dev] done. All fixture users share the password: ${DEV_PASSWORD}`);
   } finally {
     await prisma.$disconnect();
   }
